@@ -15,6 +15,11 @@ CONFIG(release, debug|release) {
     QMAKE_CXXFLAGS += -guard:cf -guard:ehcont
     QMAKE_LFLAGS += -guard:cf -guard:ehcont
 
+    # Ferry integration uses UTF-8 string literals (Chinese toolbar labels);
+    # tell MSVC to read sources as UTF-8.
+    QMAKE_CFLAGS += /utf-8
+    QMAKE_CXXFLAGS += /utf-8
+
     contains(QT_ARCH, x86_64) {
         QMAKE_LFLAGS += -cetcompat
     }

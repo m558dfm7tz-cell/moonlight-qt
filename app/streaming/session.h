@@ -94,6 +94,7 @@ class Session : public QObject
     Q_OBJECT
 
     friend class SdlInputHandler;
+    friend class FerryToolbar;
     friend class DeferredSessionCleanupTask;
     friend class AsyncConnectionStartThread;
 
@@ -260,6 +261,7 @@ private:
     QQuickWindow* m_QtWindow;
     bool m_UnexpectedTermination;
     SdlInputHandler* m_InputHandler;
+    class FerryToolbar* m_Toolbar;
     int m_MouseEmulationRefCount;
     int m_FlushingWindowEventsRef;
     QStringList m_LaunchWarnings;

@@ -5,6 +5,9 @@
 
 #include "SDL_compat.h"
 
+// Custom SDL_USEREVENT code pushed when Ferry-mode long-press Esc fires.
+#define SDL_CODE_FERRY_ESC_LONG_PRESS 200
+
 struct GamepadState {
     SDL_GameController* controller;
     SDL_JoystickID jsId;
@@ -136,9 +139,15 @@ public:
 
     void notifyMouseLeave();
 
+    void notifyMouseEnter();
+
     void notifyFocusLost();
 
     void notifyFocusGained();
+
+    // Ferry integration: long-press Esc exits fullscreen. Fired on the main
+    // thread (via a user event) once Esc has been held for ~1 second.
+    void handleEscLongPress();
 
     bool isCaptureActive();
 
@@ -192,6 +201,9 @@ private:
     Uint32 longPressTimerCallback(Uint32 interval, void* param);
 
     static
+    Uint32 escLongPressTimerCallback(Uint32 interval, void* param);
+
+    static
     Uint32 mouseEmulationTimerCallback(Uint32 interval, void* param);
 
     static
@@ -212,6 +224,7 @@ private:
 
     bool m_NeedsManualCaptureOnLeave;
     bool m_MouseWasInVideoRegion;
+    bool m_MouseInWindow;
     bool m_PendingMouseButtonsAllUpOnVideoRegionLeave;
     bool m_PointerRegionLockActive;
     bool m_PointerRegionLockToggledByUser;
@@ -237,6 +250,8 @@ private:
     SDL_TouchFingerEvent m_LastTouchDownEvent;
     SDL_TouchFingerEvent m_LastTouchUpEvent;
     SDL_TimerID m_LongPressTimer;
+    SDL_TimerID m_EscTimer;
+    bool m_EscLongPressFired;
     int m_StreamWidth;
     int m_StreamHeight;
     bool m_AbsoluteMouseMode;

@@ -1,4 +1,5 @@
 #include "commandlineparser.h"
+#include "streaming/ferry.h"
 
 #include <QCommandLineParser>
 #include <QRegularExpression>
@@ -371,6 +372,9 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addChoiceOption("capture-system-keys", "capture system key combos", m_CaptureSysKeysModeMap.keys());
     parser.addChoiceOption("video-codec", "video codec", m_VideoCodecMap.keys());
     parser.addChoiceOption("video-decoder", "video decoder", m_VideoDecoderMap.keys());
+    parser.addFlagOption("ferry", "Ferry integration mode");
+    parser.addValueOption("ferry-ipc-port", "Ferry loopback IPC port");
+    parser.addValueOption("ferry-peer-name", "Ferry peer display name");
 
     if (!parser.parse(args)) {
         parser.showError(parser.errorText());
@@ -504,6 +508,20 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // Resolve --video-decoder option
     if (parser.isSet("video-decoder")) {
         preferences->videoDecoderSelection = mapValue(m_VideoDecoderMap, parser.getChoiceOptionValue("video-decoder"));
+    }
+
+    // Resolve Ferry integration options.
+    FerryBridge::enabled = parser.isSet("ferry");
+    if (parser.isSet("ferry-ipc-port")) {
+        FerryBridge::ipcPort = parser.getIntOption("ferry-ipc-port");
+    }
+    if (parser.isSet("ferry-peer-name")) {
+        FerryBridge::peerName = parser.value("ferry-peer-name");
+    }
+    // Ferry mode always starts with the performance overlay hidden; the
+    // top-right stats are available via Moonlight's own Ctrl+Alt+Shift+S.
+    if (FerryBridge::isEnabled()) {
+        preferences->showPerformanceOverlay = false;
     }
 
     // This method will not return and terminates the process if --version or

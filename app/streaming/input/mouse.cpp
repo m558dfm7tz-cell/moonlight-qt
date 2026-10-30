@@ -6,6 +6,11 @@
 
 void SdlInputHandler::notifyMouseLeave()
 {
+    // Ferry mode: the pointer left the stream window, so system keys must be
+    // released back to the local machine immediately (Alt+Tab / Win / Alt+F4).
+    m_MouseInWindow = false;
+    updateKeyboardGrabState();
+
     if (m_NeedsManualCaptureOnLeave) {
         // SDL on Windows doesn't send the mouse button up until the mouse re-enters the window
         // after leaving it. This breaks some of the Aero snap gestures, so we'll capture it to
@@ -24,6 +29,14 @@ void SdlInputHandler::notifyMouseLeave()
             }
         }
     }
+}
+
+void SdlInputHandler::notifyMouseEnter()
+{
+    // Ferry mode: the pointer is back inside the stream window, so system keys
+    // may be captured again.
+    m_MouseInWindow = true;
+    updateKeyboardGrabState();
 }
 
 void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)

@@ -1,6 +1,8 @@
 #include "session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
+#include "streaming/ferry.h"
+#include "streaming/ferrytoolbar.h"
 #include "backend/richpresencemanager.h"
 
 #include <Limelight.h>
@@ -576,6 +578,7 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_QtWindow(nullptr),
       m_UnexpectedTermination(true), // Failure prior to streaming is unexpected
       m_InputHandler(nullptr),
+      m_Toolbar(nullptr),
       m_MouseEmulationRefCount(0),
       m_FlushingWindowEventsRef(0),
       m_ShouldExit(false),
@@ -1537,6 +1540,11 @@ void Session::toggleFullscreen()
     // Actually enter/leave fullscreen
     SDL_SetWindowFullscreen(m_Window, fullScreen ? m_FullScreenFlag : 0);
 
+    // Ferry toolbar: reflect the new fullscreen state.
+    if (m_Toolbar != nullptr) {
+        m_Toolbar->setFullscreen(fullScreen);
+    }
+
 #ifdef Q_OS_DARWIN
     // SDL on macOS has a bug that causes the window size to be reset to crazy
     // large dimensions when exiting out of true fullscreen mode. We can work
@@ -1891,6 +1899,28 @@ void Session::exec()
 
     m_InputHandler->setWindow(m_Window);
 
+    // Ferry integration: create the in-window toolbar and report the stream
+    // start back to Ferry over the loopback IPC channel.
+    if (FerryBridge::isEnabled()) {
+        m_Toolbar = new FerryToolbar(this);
+        if (m_Toolbar->init(m_Window)) {
+            QString resKey = "remote";
+            if (m_Preferences->width == 1280 && m_Preferences->height == 720) resKey = "720";
+            else if (m_Preferences->width == 1920 && m_Preferences->height == 1080) resKey = "1080";
+            else if (m_Preferences->width == 2560 && m_Preferences->height == 1440) resKey = "1440";
+            else if (m_Preferences->width == 3840 && m_Preferences->height == 2160) resKey = "4K";
+            int bitrateMbps = qMax(1, m_Preferences->bitrateKbps / 1000);
+            m_Toolbar->setQuality(resKey, m_Preferences->fps, bitrateMbps, false);
+            m_Toolbar->setFullscreen(m_IsFullScreen);
+            m_Toolbar->setFocused(true);
+        }
+        else {
+            delete m_Toolbar;
+            m_Toolbar = nullptr;
+        }
+        FerryBridge::sendHello();
+    }
+
     QSvgRenderer svgIconRenderer(QString(":/res/moonlight.svg"));
     QImage svgImage(ICON_SIZE, ICON_SIZE, QImage::Format_RGBA8888);
     svgImage.fill(0);
@@ -1977,6 +2007,10 @@ void Session::exec()
     // because we want to suspend all Qt processing until the stream is over.
     SDL_Event event;
     for (;;) {
+        // Ferry toolbar visibility (fullscreen reveal-on-top + follow).
+        if (m_Toolbar != nullptr) {
+            m_Toolbar->tick();
+        }
 #if SDL_VERSION_ATLEAST(2, 0, 18) && !defined(STEAM_LINK)
         // SDL 2.0.18 has a proper wait event implementation that uses platform
         // support to block on events rather than polling on Windows, macOS, X11,
@@ -2049,6 +2083,9 @@ void Session::exec()
                 m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.user.data1,
                                                     (DualSenseOutputReport *)event.user.data2);
                 break;
+            case SDL_CODE_FERRY_ESC_LONG_PRESS:
+                m_InputHandler->handleEscLongPress();
+                break;
             default:
                 SDL_assert(false);
             }
@@ -2062,15 +2099,24 @@ void Session::exec()
                     m_AudioMuted = true;
                 }
                 m_InputHandler->notifyFocusLost();
+                if (m_Toolbar != nullptr) {
+                    m_Toolbar->setFocused(false);
+                }
                 break;
             case SDL_WINDOWEVENT_FOCUS_GAINED:
                 if (m_Preferences->muteOnFocusLoss) {
                     m_AudioMuted = false;
                 }
                 m_InputHandler->notifyFocusGained();
+                if (m_Toolbar != nullptr) {
+                    m_Toolbar->setFocused(true);
+                }
                 break;
             case SDL_WINDOWEVENT_LEAVE:
                 m_InputHandler->notifyMouseLeave();
+                break;
+            case SDL_WINDOWEVENT_ENTER:
+                m_InputHandler->notifyMouseEnter();
                 break;
             }
 
@@ -2266,10 +2312,35 @@ void Session::exec()
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
             presence.runCallbacks();
-            m_InputHandler->handleMouseButtonEvent(&event.button);
+            if (m_Toolbar != nullptr && event.button.windowID == m_Toolbar->windowId()) {
+                m_Toolbar->handleMouseButton(&event.button);
+            }
+            else {
+                m_InputHandler->handleMouseButtonEvent(&event.button);
+            }
             break;
         case SDL_MOUSEMOTION:
-            m_InputHandler->handleMouseMotionEvent(&event.motion);
+            if (m_Toolbar != nullptr && event.motion.windowID == m_Toolbar->windowId()) {
+                m_Toolbar->handleMouseMotion(&event.motion);
+            }
+            else {
+                m_InputHandler->handleMouseMotionEvent(&event.motion);
+            }
+            break;
+        case SDL_DROPFILE:
+            // Ferry integration: forward dropped files to Ferry over the loopback
+            // IPC channel; Ferry relays them over the paired LAN channel.
+            if (event.drop.file != nullptr && FerryBridge::isEnabled()) {
+                QStringList files;
+                files.append(QString::fromUtf8(event.drop.file));
+                FerryBridge::sendFiles(files);
+                if (m_Toolbar != nullptr) {
+                    m_Toolbar->setStatus(QStringLiteral("正在发送文件…"));
+                }
+            }
+            if (event.drop.file != nullptr) {
+                SDL_free(event.drop.file);
+            }
             break;
         case SDL_MOUSEWHEEL:
             m_InputHandler->handleMouseWheelEvent(&event.wheel);
@@ -2324,6 +2395,13 @@ DispatchDeferredCleanup:
     // Switch back to synchronous logging mode
     StreamUtils::exitAsyncLoggingMode();
 
+    // Ferry integration: report the end of the session and make sure the
+    // controlled PC is never left blanked.
+    if (FerryBridge::isEnabled()) {
+        FerryBridge::sendBlank(false);
+        FerryBridge::sendQuit();
+    }
+
     // Uncapture the mouse and hide the window immediately,
     // so we can return to the Qt GUI ASAP.
     m_InputHandler->setCaptureActive(false);
@@ -2331,6 +2409,13 @@ DispatchDeferredCleanup:
     SDL_SetHint(SDL_HINT_TIMER_RESOLUTION, "0");
     if (QGuiApplication::platformName() == "eglfs") {
         QGuiApplication::restoreOverrideCursor();
+    }
+
+    // Destroy the toolbar before its parent stream window goes away.
+    if (m_Toolbar != nullptr) {
+        m_Toolbar->destroy();
+        delete m_Toolbar;
+        m_Toolbar = nullptr;
     }
 
     // Raise any keys that are still down

@@ -1,6 +1,7 @@
 #include <Limelight.h>
 #include "SDL_compat.h"
 #include "streaming/session.h"
+#include "streaming/ferry.h"
 #include "settings/mappingmanager.h"
 #include "path.h"
 #include "utils.h"
@@ -16,6 +17,7 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
       m_ReverseScrollDirection(prefs.reverseScrollDirection),
       m_SwapFaceButtons(prefs.swapFaceButtons),
       m_MouseWasInVideoRegion(false),
+      m_MouseInWindow(false),
       m_PendingMouseButtonsAllUpOnVideoRegionLeave(false),
       m_PointerRegionLockActive(false),
       m_PointerRegionLockToggledByUser(false),
@@ -24,6 +26,8 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
       m_CaptureSystemKeysMode(prefs.captureSysKeysMode),
       m_MouseCursorCapturedVisibilityState(SDL_DISABLE),
       m_LongPressTimer(0),
+      m_EscTimer(0),
+      m_EscLongPressFired(false),
       m_StreamWidth(streamWidth),
       m_StreamHeight(streamHeight),
       m_AbsoluteMouseMode(prefs.absoluteMouseMode),
@@ -234,6 +238,7 @@ SdlInputHandler::~SdlInputHandler()
     }
 
     SDL_RemoveTimer(m_LongPressTimer);
+    SDL_RemoveTimer(m_EscTimer);
     SDL_RemoveTimer(m_LeftButtonReleaseTimer);
     SDL_RemoveTimer(m_RightButtonReleaseTimer);
     SDL_RemoveTimer(m_DragTimer);
@@ -309,6 +314,13 @@ void SdlInputHandler::updateKeyboardGrabState()
             // Ungrab if it's fullscreen only and we left fullscreen
             shouldGrab = false;
         }
+    }
+
+    // Ferry mode: capture system keys (Alt+Tab / Win / Alt+F4 ...) only while
+    // the pointer is over the stream window. The moment the pointer leaves,
+    // the grab is released so those shortcuts go to the local machine.
+    if (FerryBridge::isEnabled() && !m_MouseInWindow) {
+        shouldGrab = false;
     }
 
     // Don't close the window on Alt+F4 when keyboard grab is enabled

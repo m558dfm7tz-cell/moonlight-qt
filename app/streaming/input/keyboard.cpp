@@ -1,4 +1,5 @@
 #include "streaming/session.h"
+#include "streaming/ferry.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -182,6 +183,32 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
     }
 }
 
+Uint32 SdlInputHandler::escLongPressTimerCallback(Uint32, void* param)
+{
+    SdlInputHandler* self = static_cast<SdlInputHandler*>(param);
+    const Uint8* keys = SDL_GetKeyboardState(nullptr);
+    if (keys != nullptr && keys[SDL_SCANCODE_ESCAPE]) {
+        self->m_EscLongPressFired = true;
+        SDL_Event ev;
+        SDL_zero(ev);
+        ev.type = SDL_USEREVENT;
+        ev.user.code = SDL_CODE_FERRY_ESC_LONG_PRESS;
+        ev.user.data1 = 0;
+        ev.user.data2 = 0;
+        SDL_PushEvent(&ev);
+    }
+    return 0;
+}
+
+void SdlInputHandler::handleEscLongPress()
+{
+    // Long-press Esc exits fullscreen (never enters it; F11 toggles).
+    if (m_Window != nullptr && (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_FULLSCREEN)) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Ferry long-press Esc: exit fullscreen");
+        Session::s_ActiveSession->toggleFullscreen();
+    }
+}
+
 void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
 {
     short keyCode;
@@ -193,6 +220,55 @@ void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
         // Ignore repeat key down events
         SDL_assert(event->state == SDL_PRESSED);
         return;
+    }
+
+    // Ferry integration: Ctrl+Alt+Q disconnects, F11 toggles fullscreen, and
+    // long-press Esc (~1s) exits fullscreen while a short press is forwarded
+    // to the host as usual.
+    if (FerryBridge::isEnabled()) {
+        if (event->keysym.scancode == SDL_SCANCODE_ESCAPE &&
+                !(event->keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_SHIFT | KMOD_GUI))) {
+            if (event->state == SDL_PRESSED) {
+                m_EscLongPressFired = false;
+                SDL_RemoveTimer(m_EscTimer);
+                m_EscTimer = SDL_AddTimer(1000, escLongPressTimerCallback, this);
+                // Hold Esc; decide on release whether to forward it or exit fullscreen.
+                return;
+            }
+            else { // SDL_RELEASED
+                SDL_RemoveTimer(m_EscTimer);
+                m_EscTimer = 0;
+                if (!m_EscLongPressFired) {
+                    // Short press: forward Esc press+release to the host.
+                    LiSendKeyboardEvent2(0x1B | 0x8000, KEY_ACTION_DOWN, 0, 0);
+                    LiSendKeyboardEvent2(0x1B | 0x8000, KEY_ACTION_UP, 0, 0);
+                }
+                m_EscLongPressFired = false;
+                return;
+            }
+        }
+
+        if (event->state == SDL_PRESSED &&
+                (event->keysym.mod & KMOD_CTRL) && (event->keysym.mod & KMOD_ALT) &&
+                !(event->keysym.mod & (KMOD_SHIFT | KMOD_GUI)) &&
+                (event->keysym.sym == SDLK_q || event->keysym.scancode == SDL_SCANCODE_Q)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Ferry quit combo (Ctrl+Alt+Q)");
+            FerryBridge::sendBlank(false);
+            FerryBridge::sendQuit();
+            SDL_Event quitEvent;
+            SDL_zero(quitEvent);
+            quitEvent.type = SDL_QUIT;
+            quitEvent.quit.timestamp = SDL_GetTicks();
+            SDL_PushEvent(&quitEvent);
+            return;
+        }
+
+        if (event->state == SDL_PRESSED && event->keysym.scancode == SDL_SCANCODE_F11 &&
+                !(event->keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_SHIFT | KMOD_GUI))) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Ferry fullscreen toggle (F11)");
+            Session::s_ActiveSession->toggleFullscreen();
+            return;
+        }
     }
 
     // Check for our special key combos
