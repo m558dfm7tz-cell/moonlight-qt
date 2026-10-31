@@ -3,6 +3,7 @@
 #include <Limelight.h>
 #include "SDL_compat.h"
 #include "streaming/streamutils.h"
+#include "streaming/ferry.h"
 
 void SdlInputHandler::notifyMouseLeave()
 {
@@ -10,6 +11,17 @@ void SdlInputHandler::notifyMouseLeave()
     // released back to the local machine immediately (Alt+Tab / Win / Alt+F4).
     m_MouseInWindow = false;
     updateKeyboardGrabState();
+
+    if (FerryBridge::isEnabled()) {
+        // The Ferry toolbar is its own SDL window overlapping the top of the
+        // stream, so the pointer can leave the stream window while still being
+        // inside the picture area. Make sure the local cursor is visible again
+        // (capture may have hidden it) and reset the video-region tracking so
+        // the first motion event after re-entry re-hides it correctly. This
+        // also prevents a stuck hidden-cursor ghost at the window edge.
+        m_MouseWasInVideoRegion = false;
+        SDL_ShowCursor(SDL_ENABLE);
+    }
 
     if (m_NeedsManualCaptureOnLeave) {
         // SDL on Windows doesn't send the mouse button up until the mouse re-enters the window

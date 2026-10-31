@@ -33,9 +33,16 @@ public:
     static void sendBlank(bool on);
     static void sendQuit();
     static void sendReconnect(const QString& resolution, int fps, int bitrateMbps, bool bitrateAuto);
-    static void sendFiles(const QStringList& paths);
+    // Send dropped file paths together with the drop position in the remote
+    // stream's coordinate space (pixels of the stream, 0..streamWidth/Height)
+    // and the stream resolution, so the receiving Ferry can resolve which
+    // Explorer window / desktop the file was dropped onto.
+    static void sendFiles(const QStringList& paths, int x, int y, int streamWidth, int streamHeight);
     static void sendStatus(const QString& text);
     static void sendNeedPair();
+    // The pointer left the stream window while the left button was held: the
+    // user is dragging a file OUT of the remote desktop back to this machine.
+    static void sendDragOut();
 
 private:
     static QTcpSocket* socket();

@@ -73,11 +73,15 @@ void FerryBridge::sendReconnect(const QString& resolution, int fps, int bitrateM
     send(obj);
 }
 
-void FerryBridge::sendFiles(const QStringList& paths)
+void FerryBridge::sendFiles(const QStringList& paths, int x, int y, int streamWidth, int streamHeight)
 {
     QJsonObject obj;
     obj.insert("type", "files");
     obj.insert("paths", QJsonArray::fromStringList(paths));
+    obj.insert("x", x);
+    obj.insert("y", y);
+    obj.insert("streamWidth", streamWidth);
+    obj.insert("streamHeight", streamHeight);
     send(obj);
 }
 
@@ -93,5 +97,12 @@ void FerryBridge::sendNeedPair()
 {
     QJsonObject obj;
     obj.insert("type", "needpair");
+    send(obj);
+}
+
+void FerryBridge::sendDragOut()
+{
+    QJsonObject obj;
+    obj.insert("type", "dragout");
     send(obj);
 }

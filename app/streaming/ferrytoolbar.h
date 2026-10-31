@@ -93,6 +93,7 @@ private:
 
     void layout();
     void render();
+    void setShape(); // rounded-corner + semi-transparent dark-glass window shape
     void blitText(struct SDL_Surface* dst, const QString& text, SDL_Color color, int x, int y);
     void drawButton(struct SDL_Surface* dst, const Item& item);
 
@@ -144,6 +145,11 @@ private:
     // Auto-hide state (fullscreen reveal-on-top).
     bool m_visible;
     Uint32 m_lastTopTick;
+
+    // Last toolbar window position, used to avoid redundant SetWindowPosition
+    // calls while the pointer is near the toolbar (which could otherwise stutter).
+    int m_lastTx;
+    int m_lastTy;
 
     QVector<Item> m_items;
 };

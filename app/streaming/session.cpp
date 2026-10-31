@@ -2092,33 +2092,72 @@ void Session::exec()
             break;
 
         case SDL_WINDOWEVENT:
+        {
+            // The Ferry toolbar is its own top-level SDL window overlapping the
+            // stream window. Only window events from the STREAM window may drive
+            // the input handler, otherwise moving onto/off the toolbar would be
+            // misread as the mouse entering/leaving the stream (and would leave
+            // system keys captured while over the toolbar).
+            Uint32 streamWindowId = SDL_GetWindowID(m_Window);
+            bool fromStreamWindow = event.window.windowID == streamWindowId;
+
             // Early handling of some events
             switch (event.window.event) {
+            case SDL_WINDOWEVENT_CLOSE:
+                if (fromStreamWindow) {
+                    // The title-bar X must end the session (not just hide the
+                    // window). Route through SDL_QUIT so the deferred cleanup
+                    // restores the remote monitor and notifies Ferry.
+                    SDL_Event quitEvent;
+                    SDL_zero(quitEvent);
+                    quitEvent.type = SDL_QUIT;
+                    quitEvent.quit.timestamp = SDL_GetTicks();
+                    SDL_PushEvent(&quitEvent);
+                }
+                break;
             case SDL_WINDOWEVENT_FOCUS_LOST:
-                if (m_Preferences->muteOnFocusLoss) {
+                if (fromStreamWindow && m_Preferences->muteOnFocusLoss) {
                     m_AudioMuted = true;
                 }
-                m_InputHandler->notifyFocusLost();
-                if (m_Toolbar != nullptr) {
-                    m_Toolbar->setFocused(false);
+                if (fromStreamWindow) {
+                    m_InputHandler->notifyFocusLost();
+                    if (m_Toolbar != nullptr) {
+                        m_Toolbar->setFocused(false);
+                    }
                 }
                 break;
             case SDL_WINDOWEVENT_FOCUS_GAINED:
-                if (m_Preferences->muteOnFocusLoss) {
+                if (fromStreamWindow && m_Preferences->muteOnFocusLoss) {
                     m_AudioMuted = false;
                 }
-                m_InputHandler->notifyFocusGained();
-                if (m_Toolbar != nullptr) {
-                    m_Toolbar->setFocused(true);
+                if (fromStreamWindow) {
+                    m_InputHandler->notifyFocusGained();
+                    if (m_Toolbar != nullptr) {
+                        m_Toolbar->setFocused(true);
+                    }
                 }
                 break;
             case SDL_WINDOWEVENT_LEAVE:
-                m_InputHandler->notifyMouseLeave();
+                if (fromStreamWindow) {
+                    m_InputHandler->notifyMouseLeave();
+                    // Ferry: leaving the stream window while the left button is
+                    // held means the user is dragging a file out of the remote
+                    // desktop back onto this machine. Ask Ferry to pull it.
+                    if (FerryBridge::isEnabled()) {
+                        Uint32 buttons = SDL_GetMouseState(nullptr, nullptr);
+                        if (buttons & SDL_BUTTON(SDL_BUTTON_LEFT)) {
+                            FerryBridge::sendDragOut();
+                        }
+                    }
+                }
                 break;
             case SDL_WINDOWEVENT_ENTER:
-                m_InputHandler->notifyMouseEnter();
+                if (fromStreamWindow) {
+                    m_InputHandler->notifyMouseEnter();
+                }
                 break;
             }
+        }
 
             presence.runCallbacks();
 
@@ -2329,11 +2368,43 @@ void Session::exec()
             break;
         case SDL_DROPFILE:
             // Ferry integration: forward dropped files to Ferry over the loopback
-            // IPC channel; Ferry relays them over the paired LAN channel.
+            // IPC channel; Ferry relays them over the paired LAN channel. The drop
+            // position (in stream pixels) is computed with the same letterbox math
+            // as the absolute-mouse path, so the receiving Ferry can resolve which
+            // Explorer window / desktop the user dropped onto.
             if (event.drop.file != nullptr && FerryBridge::isEnabled()) {
                 QStringList files;
                 files.append(QString::fromUtf8(event.drop.file));
-                FerryBridge::sendFiles(files);
+
+                int streamX = 0, streamY = 0;
+                int streamW = m_StreamConfig.width;
+                int streamH = m_StreamConfig.height;
+                if (streamW > 0 && streamH > 0) {
+                    int windowW, windowH;
+                    SDL_GetWindowSize(m_Window, &windowW, &windowH);
+
+                    SDL_Rect src, dst;
+                    src.x = src.y = 0;
+                    src.w = streamW;
+                    src.h = streamH;
+                    dst.x = dst.y = 0;
+                    dst.w = windowW;
+                    dst.h = windowH;
+                    StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
+
+                    // SDL 2.24+ removed the x/y fields from SDL_DropEvent, so read
+                    // the pointer position (window-relative, same space as mouse
+                    // events) at drop time and map it into stream space, clamping
+                    // to the stream bounds so the host always receives a valid point.
+                    int dropX, dropY;
+                    SDL_GetMouseState(&dropX, &dropY);
+                    int localX = dropX - dst.x;
+                    int localY = dropY - dst.y;
+                    if (dst.w > 0) streamX = qMin(qMax(localX * streamW / dst.w, 0), streamW - 1);
+                    if (dst.h > 0) streamY = qMin(qMax(localY * streamH / dst.h, 0), streamH - 1);
+                }
+
+                FerryBridge::sendFiles(files, streamX, streamY, streamW, streamH);
                 if (m_Toolbar != nullptr) {
                     m_Toolbar->setStatus(QStringLiteral("正在发送文件…"));
                 }

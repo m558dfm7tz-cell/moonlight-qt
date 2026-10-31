@@ -23,9 +23,10 @@
 #define TOOLBAR_STATUS_MS 6000
 #define TOOLBAR_FS_HIDE_MS 1500
 
-static SDL_Color C_BAR_BG   = { 20, 28, 40, 255 };
-static SDL_Color C_BTN      = { 40, 52, 70, 255 };
-static SDL_Color C_BTN_HOV  = { 55, 70, 92, 255 };
+// Ferry dark-glass palette (mirrors the WPF settings / main window).
+static SDL_Color C_BAR_BG   = { 16, 27, 38, 255 };
+static SDL_Color C_BTN      = { 28, 40, 54, 255 };
+static SDL_Color C_BTN_HOV  = { 35, 71, 108, 255 };
 static SDL_Color C_ACCENT   = { 37, 102, 179, 255 };
 static SDL_Color C_ACCENT_H = { 61, 131, 210, 255 };
 static SDL_Color C_DANGER   = { 186, 62, 52, 255 };
@@ -57,7 +58,9 @@ FerryToolbar::FerryToolbar(Session* session)
       m_pendingBitrateMbps(20),
       m_pendingBitrateAuto(false),
       m_visible(false),
-      m_lastTopTick(0)
+      m_lastTopTick(0),
+      m_lastTx(-1),
+      m_lastTy(-1)
 {
 #ifdef Q_OS_WIN32
     m_streamHwnd = nullptr;
@@ -120,6 +123,11 @@ bool FerryToolbar::init(SDL_Window* streamWindow)
         return false;
     }
     m_windowId = SDL_GetWindowID(m_window);
+
+    // Ferry dark-glass style: semi-transparent, rounded corners. Opacity is a
+    // whole-window alpha; the rounded shape is applied in setShape() once the
+    // surface is sized.
+    SDL_SetWindowOpacity(m_window, 0.92f);
 
 #ifdef Q_OS_WIN32
     // Never activate the toolbar on click so keyboard focus stays with the stream window.
@@ -505,6 +513,44 @@ void FerryToolbar::render()
     }
 
     SDL_UpdateWindowSurface(m_window);
+
+    setShape();
+}
+
+void FerryToolbar::setShape()
+{
+    if (m_window == nullptr || m_surfaceW <= 0 || m_surfaceH <= 0) {
+        return;
+    }
+
+    // Ferry dark-glass style: rounded corners. SDL_SetWindowShape treats the
+    // shape surface's alpha channel as a per-pixel mask, so the corners are
+    // transparent and the rest opaque. Combined with SDL_SetWindowOpacity this
+    // matches the semi-transparent rounded cards of the main Ferry UI.
+    const int radius = 10;
+    SDL_Surface* shape = SDL_CreateRGBSurfaceWithFormat(0, m_surfaceW, m_surfaceH, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (shape == nullptr) {
+        return;
+    }
+    SDL_FillRect(shape, nullptr, SDL_MapRGBA(shape->format, 0, 0, 0, 0));
+
+    Uint32 opaque = SDL_MapRGBA(shape->format, 255, 255, 255, 255);
+    int r = qMin(radius, qMin(m_surfaceW, m_surfaceH) / 2);
+    for (int y = 0; y < m_surfaceH; y++) {
+        for (int x = 0; x < m_surfaceW; x++) {
+            int dx = 0, dy = 0;
+            if (x < r) dx = r - x;
+            else if (x >= m_surfaceW - r) dx = x - (m_surfaceW - r - 1);
+            if (y < r) dy = r - y;
+            else if (y >= m_surfaceH - r) dy = y - (m_surfaceH - r - 1);
+            if (dx * dx + dy * dy <= r * r) {
+                ((Uint32*)shape->pixels)[y * (shape->pitch / 4) + x] = opaque;
+            }
+        }
+    }
+
+    SDL_SetWindowShape(m_window, shape, nullptr);
+    SDL_FreeSurface(shape);
 }
 
 void FerryToolbar::follow()
@@ -557,7 +603,11 @@ void FerryToolbar::followTo(int wx, int wy, int ww)
     int tx = cx + (cw - m_surfaceW) / 2;
     if (tx < cx) tx = cx;
     int ty = cy + 2;
-    SDL_SetWindowPosition(m_window, tx, ty);
+    if (tx != m_lastTx || ty != m_lastTy) {
+        SDL_SetWindowPosition(m_window, tx, ty);
+        m_lastTx = tx;
+        m_lastTy = ty;
+    }
 }
 
 #ifdef Q_OS_WIN32
@@ -641,10 +691,18 @@ bool FerryToolbar::handleMouseMotion(const SDL_MouseMotionEvent* ev)
         return false;
     }
     Item* hit = itemAt(ev->x, ev->y);
+    bool changed = false;
     for (Item& item : m_items) {
-        item.hover = (&item == hit);
+        bool hov = (&item == hit);
+        if (item.hover != hov) changed = true;
+        item.hover = hov;
     }
-    render();
+    // Only re-render when the hovered item actually changes. Re-rendering the
+    // whole bar (text layout + surface blit) on every motion event while the
+    // pointer is near/over the toolbar caused a visible stutter.
+    if (changed) {
+        render();
+    }
     return true;
 }
 

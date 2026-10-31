@@ -292,6 +292,14 @@ void SdlInputHandler::notifyFocusLost()
 
 void SdlInputHandler::notifyFocusGained()
 {
+    // Ferry mode: re-sync the host cursor the moment the stream window regains
+    // focus. In absolute mode capture is kept across focus loss, so the normal
+    // capture path never runs on regain; without this the first motion after
+    // clicking into the window can feel delayed while the host cursor catches
+    // up to the local pointer.
+    if (FerryBridge::isEnabled() && m_AbsoluteMouseMode && isCaptureActive()) {
+        setCaptureActive(true);
+    }
 }
 
 bool SdlInputHandler::isCaptureActive()
