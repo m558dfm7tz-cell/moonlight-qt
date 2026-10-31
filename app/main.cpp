@@ -53,6 +53,7 @@
 #include "backend/computermanager.h"
 #include "backend/systemproperties.h"
 #include "streaming/session.h"
+#include "streaming/ferrytoolbar_preview.h"
 #include "settings/streamingpreferences.h"
 #include "gui/sdlgamepadkeynavigation.h"
 
@@ -787,6 +788,14 @@ int main(int argc, char *argv[])
     }
 
     QGuiApplication app(argc, argv);
+
+    // Ferry dev-only toolbar preview: render fixed toolbar states over a plain
+    // background, capture PNG screenshots of each state, then exit. Activated
+    // by FERRY_TOOLBAR_PREVIEW=<output-dir>; never used in normal operation.
+    QByteArray ferryToolbarPreviewDir = qgetenv("FERRY_TOOLBAR_PREVIEW");
+    if (!ferryToolbarPreviewDir.isEmpty()) {
+        return runFerryToolbarPreview(QString::fromUtf8(ferryToolbarPreviewDir));
+    }
 
 #ifdef Q_OS_DARWIN
     // macOS defaults "Keyboard navigation" to text fields and lists only, which

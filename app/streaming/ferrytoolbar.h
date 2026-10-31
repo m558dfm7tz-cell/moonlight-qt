@@ -67,6 +67,13 @@ public:
     void handleFerryMessage(const QJsonObject& obj);
     void handleTransferProgress(const QJsonObject& obj);
 
+    // Development-only preview hook, used solely by the FERRY_TOOLBAR_PREVIEW
+    // entry point to render fixed states for screenshots. Never called during
+    // normal streaming. Sets dock/expand/privacy/audio/quality/progress and
+    // re-renders.
+    void debugSetState(DockEdge edge, bool expanded, bool privacyOn, bool audioOnHost,
+                       bool audioMutedLocal, bool qualityOpen, int transferPercent);
+
 private:
     enum ButtonId {
         BtnDrag,

@@ -298,6 +298,31 @@ void FerryToolbar::setStreamOptions(const QString& codec, bool audioOnHost)
     render();
 }
 
+void FerryToolbar::debugSetState(DockEdge edge, bool expanded, bool privacyOn, bool audioOnHost,
+                                 bool audioMutedLocal, bool qualityOpen, int transferPercent)
+{
+    m_dockEdge = edge;
+    m_expanded = expanded;
+    m_privacy = privacyOn;
+    m_audioOnHost = audioOnHost;
+    m_audioMutedLocal = audioMutedLocal;
+    m_qualityOpen = qualityOpen;
+    if (m_session != nullptr) {
+        m_session->setAudioMuted(audioMutedLocal && !audioOnHost);
+    }
+    if (transferPercent >= 0) {
+        m_transferActive = true;
+        m_transferPercent = qBound(0, transferPercent, 100);
+        m_lastTransferTick = SDL_GetTicks();
+    }
+    else {
+        m_transferActive = false;
+        m_transferPercent = 0;
+        m_lastTransferTick = 0;
+    }
+    render();
+}
+
 void FerryToolbar::handleTransferProgress(const QJsonObject& obj)
 {
     if (obj.value("type").toString() != QLatin1String("transferProgress")) {

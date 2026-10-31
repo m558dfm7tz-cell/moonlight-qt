@@ -196,6 +196,7 @@ SOURCES += \
     streaming/audio/renderers/sdlaud.cpp \
     streaming/ferry.cpp \
     streaming/ferrytoolbar.cpp \
+    streaming/ferrytoolbar_preview.cpp \
     gui/computermodel.cpp \
     gui/appmodel.cpp \
     streaming/bandwidth.cpp \
@@ -240,6 +241,7 @@ HEADERS += \
     streaming/streamutils.h \
     streaming/ferry.h \
     streaming/ferrytoolbar.h \
+    streaming/ferrytoolbar_preview.h \
     backend/autoupdatechecker.h \
     path.h \
     settings/mappingmanager.h \
