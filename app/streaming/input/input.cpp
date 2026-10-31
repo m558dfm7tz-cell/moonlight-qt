@@ -182,8 +182,12 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
                      SDL_GetError());
     }
 
-    MappingManager mappingManager;
-    mappingManager.applyMappings();
+    // Ferry mode: skip loading user gamepad mappings. The remote-desktop flow
+    // doesn't use gamepads and this saves startup work on every connection.
+    if (!FerryBridge::isEnabled()) {
+        MappingManager mappingManager;
+        mappingManager.applyMappings();
+    }
 
     // Flush gamepad arrival and departure events which may be queued before
     // starting the gamecontroller subsystem again. This prevents us from

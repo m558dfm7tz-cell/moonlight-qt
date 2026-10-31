@@ -3,12 +3,17 @@
 #include <QTcpSocket>
 #include <QJsonDocument>
 #include <QJsonArray>
+#include <QJsonParseError>
+#include <QDateTime>
 
 bool FerryBridge::enabled = false;
 int FerryBridge::ipcPort = 0;
 QString FerryBridge::peerName;
 QTcpSocket* FerryBridge::s_socket = nullptr;
 bool FerryBridge::s_connected = false;
+std::function<void(const QJsonObject&)> FerryBridge::s_messageHandler;
+QByteArray FerryBridge::s_readBuffer;
+qint64 FerryBridge::s_lastDragOutMs = 0;
 
 QTcpSocket* FerryBridge::socket()
 {
@@ -102,7 +107,60 @@ void FerryBridge::sendNeedPair()
 
 void FerryBridge::sendDragOut()
 {
+    // The drag-out can be detected both by the SDL window-leave event and by
+    // the absolute-mouse video-region transition; de-duplicate so a single
+    // gesture doesn't ask Ferry twice.
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - s_lastDragOutMs < 1000) {
+        return;
+    }
+    s_lastDragOutMs = now;
+
+    qInfo() << "[FerryDragOut] dragout sent";
+
     QJsonObject obj;
     obj.insert("type", "dragout");
     send(obj);
+}
+
+void FerryBridge::setMessageHandler(const std::function<void(const QJsonObject&)>& handler)
+{
+    s_messageHandler = handler;
+}
+
+void FerryBridge::readMessages()
+{
+    if (!isEnabled()) {
+        return;
+    }
+
+    QTcpSocket* s = socket();
+    if (s == nullptr || !s_connected) {
+        return;
+    }
+
+    // The Qt event loop is suspended while streaming, so the socket notifier
+    // never fires and QTcpSocket won't fill its buffer on its own. Force a
+    // non-blocking poll+read of the fd before consuming whatever arrived.
+    s->waitForReadyRead(0);
+    s_readBuffer.append(s->readAll());
+
+    int newlineIndex;
+    while ((newlineIndex = s_readBuffer.indexOf('\n')) >= 0) {
+        QByteArray line = s_readBuffer.left(newlineIndex).trimmed();
+        s_readBuffer.remove(0, newlineIndex + 1);
+        if (line.isEmpty()) {
+            continue;
+        }
+
+        QJsonParseError parseError;
+        QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            continue;
+        }
+
+        if (s_messageHandler) {
+            s_messageHandler(doc.object());
+        }
+    }
 }

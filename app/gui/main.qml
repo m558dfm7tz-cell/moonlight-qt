@@ -377,8 +377,12 @@ ApplicationWindow {
                 }
 
                 Component.onCompleted: {
-                    AutoUpdateChecker.onUpdateAvailable.connect(updateAvailable)
-                    AutoUpdateChecker.start()
+                    // Skip the update check for CLI/stream launches (Ferry mode
+                    // etc.); only the normal GUI host list needs it.
+                    if (isGuiLaunch) {
+                        AutoUpdateChecker.onUpdateAvailable.connect(updateAvailable)
+                        AutoUpdateChecker.start()
+                    }
                 }
 
                 Keys.onDownPressed: {

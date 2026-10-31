@@ -11,6 +11,7 @@
 #include <QFont>
 #include <QCursor>
 #include <QElapsedTimer>
+#include <QDateTime>
 #include <QTemporaryFile>
 #include <QRegularExpression>
 
@@ -502,6 +503,11 @@ int main(int argc, char *argv[])
     // Serialize log messages on a single thread
     s_LoggerThread.setMaxThreadCount(1);
     s_LoggerTime.start();
+
+    // Ferry timing: process entry. Combined with Ferry's own "clicked remote"
+    // and "launched Moonlight" timestamps, this lets the user quantify the
+    // end-to-end latency (click -> launch -> handshake -> first frame).
+    qInfo() << "[FerryTiming] process_start ms=" << QDateTime::currentMSecsSinceEpoch();
 
     // Register our logger with all libraries
 #if SDL_VERSION_ATLEAST(3, 0, 0)

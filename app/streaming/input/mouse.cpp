@@ -21,6 +21,36 @@ void SdlInputHandler::notifyMouseLeave()
         // also prevents a stuck hidden-cursor ghost at the window edge.
         m_MouseWasInVideoRegion = false;
         SDL_ShowCursor(SDL_ENABLE);
+
+        // Ferry: the final absolute position left the remote cursor stuck at
+        // the left/top edge of the picture after the pointer left. Send one
+        // last position parked at the bottom-right corner (a neutral resting
+        // spot; the right/bottom edges already show no ghost) so the remote
+        // picture is cleared of the edge ghost. Skipped while a button is held
+        // so dragging a file out is not disturbed.
+        if (m_AbsoluteMouseMode && m_Window != nullptr) {
+            Uint32 buttons = SDL_GetMouseState(nullptr, nullptr);
+            if (buttons == 0) {
+                int windowWidth, windowHeight;
+                SDL_GetWindowSize(m_Window, &windowWidth, &windowHeight);
+
+                SDL_Rect src, dst;
+                src.x = src.y = 0;
+                src.w = m_StreamWidth;
+                src.h = m_StreamHeight;
+                dst.x = dst.y = 0;
+                dst.w = windowWidth;
+                dst.h = windowHeight;
+                StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
+
+                if (dst.w > 0 && dst.h > 0) {
+                    // (dst.w, dst.h) is clamped to the bottom-right corner by
+                    // LiSendMousePositionEvent.
+                    LiSendMousePositionEvent((short)dst.w, (short)dst.h,
+                                             (short)dst.w, (short)dst.h);
+                }
+            }
+        }
     }
 
     if (m_NeedsManualCaptureOnLeave) {
@@ -193,6 +223,15 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
                 // If we still have a button pressed on leave, wait for that to come up
                 // before we stop sending mouse position events.
                 m_PendingMouseButtonsAllUpOnVideoRegionLeave = true;
+
+                // Ferry: the pointer just left the video region while the left
+                // button was held, i.e. the user is dragging a file out of the
+                // remote desktop. This is more reliable than the window-leave
+                // event when the video is letterboxed inside the stream window.
+                // (FerryBridge de-duplicates the two trigger sites.)
+                if (FerryBridge::isEnabled() && (buttonState & SDL_BUTTON(SDL_BUTTON_LEFT))) {
+                    FerryBridge::sendDragOut();
+                }
             }
         }
 

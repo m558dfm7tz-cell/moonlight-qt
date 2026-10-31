@@ -4,21 +4,35 @@
 
 #include <QString>
 #include <QVector>
+#include <QJsonObject>
 
 class Session;
 
 // Ferry in-window toolbar.
 //
-// Renders a dark bar (peer name + 全屏 / 黑屏隐私 / 清晰度 / 结束远程 buttons
-// plus an inline quality panel) in its own borderless, always-on-top,
-// non-activating SDL window that tracks the top-centre of Moonlight's stream
-// window. All actions are performed by Moonlight itself (fullscreen toggle,
-// black-screen privacy, end session, quality reconnect via FerryBridge), so
-// Ferry no longer needs an external overlay window or any SetForegroundWindow
-// focus stealing.
+// A frosted-glass (semi-transparent, rounded) dark capsule drawn with white
+// line icons, in its own borderless, always-on-top, non-activating SDL window.
+// Button order: drag handle / fullscreen / black-screen privacy / quality /
+// transfer (with progress bar) / end session. The bar can be dragged and docked
+// to any of the four edges of the stream window; when docked left or right the
+// buttons are laid out vertically. Moving the pointer away collapses it to a
+// small drag handle; hovering (or, in fullscreen, moving to the middle of the
+// docked edge) expands it again.
+//
+// All actions are performed by Moonlight itself (fullscreen toggle, black
+// screen privacy, end session, quality reconnect via FerryBridge), so Ferry no
+// longer needs an external overlay window or focus stealing. Transfer progress
+// arrives from Ferry over the loopback IPC channel (transferProgress messages).
 class FerryToolbar
 {
 public:
+    enum DockEdge {
+        DockTop,
+        DockBottom,
+        DockLeft,
+        DockRight
+    };
+
     explicit FerryToolbar(Session* session);
     ~FerryToolbar();
 
@@ -31,7 +45,7 @@ public:
     Uint32 windowId() const { return m_windowId; }
     bool isValid() const { return m_window != nullptr; }
 
-    // Reposition the toolbar over the top-centre of the stream window.
+    // Reposition the toolbar against its docked edge of the stream window.
     void follow();
 
     // Reposition the toolbar from an explicit stream-window rectangle. Used by
@@ -40,7 +54,9 @@ public:
     // reached.
     void followTo(int wx, int wy, int ww);
 
-    // Update focus state and recompute visibility (auto-hide in fullscreen).
+    // Update focus state. Visibility is now driven by the pointer position
+    // (hover-to-expand, leave-to-collapse) rather than by focus, so this only
+    // records the state for callers that still query it.
     void setFocused(bool focused);
     void tick();
 
@@ -55,11 +71,16 @@ public:
     void setQuality(const QString& resKey, int fps, int bitrateMbps, bool bitrateAuto);
     void setStatus(const QString& text);
 
+    // Ferry -> Moonlight transferProgress message (see wb_AG_ipc_spec.md).
+    void handleTransferProgress(const QJsonObject& obj);
+
 private:
     enum ButtonId {
+        BtnDrag,
         BtnFullscreen,
         BtnPrivacy,
         BtnQuality,
+        BtnTransfer,
         BtnEnd,
         BtnResRemote,
         BtnResLocal,
@@ -95,12 +116,24 @@ private:
     void render();
     void setShape(); // rounded-corner + semi-transparent dark-glass window shape
     void blitText(struct SDL_Surface* dst, const QString& text, SDL_Color color, int x, int y);
-    void drawButton(struct SDL_Surface* dst, const Item& item);
+
+    // White line-icon drawing primitives (software surface).
+    static void putPixel(struct SDL_Surface* dst, int x, int y, SDL_Color c);
+    static void drawLine(struct SDL_Surface* dst, int x0, int y0, int x1, int y1, SDL_Color c);
+    static void fillCircle(struct SDL_Surface* dst, int cx, int cy, int r, SDL_Color c);
+    static void fillRoundedRect(struct SDL_Surface* dst, const SDL_Rect& r, int radius, SDL_Color c);
+    static void drawIcon(struct SDL_Surface* dst, ButtonId id, const SDL_Rect& r, SDL_Color c);
 
     Item* itemAt(int x, int y);
     Item* itemById(ButtonId id);
     void onButton(ButtonId id);
-    void syncLabels();
+    QString qualityLabel() const;
+
+    // Position/size helpers.
+    void computeClientRect(int& cx, int& cy, int& cw, int& ch);
+    void reposition(int cx, int cy, int cw, int ch);
+    void dockToNearestEdge();
+    bool isHorizontal() const { return m_dockEdge == DockTop || m_dockEdge == DockBottom; }
 
     Session* m_session;
     SDL_Window* m_streamWindow;
@@ -119,7 +152,6 @@ private:
 
     void* m_font; // TTF_Font*
     int m_fontSize;
-    int m_barHeight;
     int m_surfaceW;
     int m_surfaceH;
 
@@ -142,9 +174,23 @@ private:
     int m_pendingBitrateMbps;
     bool m_pendingBitrateAuto;
 
-    // Auto-hide state (fullscreen reveal-on-top).
-    bool m_visible;
-    Uint32 m_lastTopTick;
+    // Dock / expand state.
+    DockEdge m_dockEdge;
+    bool m_expanded;
+    Uint32 m_lastActivityTick;
+    bool m_dragging;
+    int m_dragGrabX;
+    int m_dragGrabY;
+
+    // Transfer progress (driven by Ferry -> Moonlight transferProgress).
+    bool m_transferActive;
+    int m_transferPercent;
+    Uint32 m_lastTransferTick;
+    Uint32 m_transferDoneTick;
+    bool m_showProgress;
+    bool m_progressVertical;
+    SDL_Rect m_progressTrack;
+    SDL_Rect m_progressFill;
 
     // Last toolbar window position, used to avoid redundant SetWindowPosition
     // calls while the pointer is near the toolbar (which could otherwise stutter).

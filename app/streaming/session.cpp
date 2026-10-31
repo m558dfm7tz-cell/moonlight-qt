@@ -42,6 +42,8 @@
 #include <QGuiApplication>
 #include <QCursor>
 #include <QScreen>
+#include <QDateTime>
+#include <QSettings>
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QQuickOpenGLUtils>
@@ -490,17 +492,58 @@ void Session::getDecoderInfo(SDL_Window* window,
                  "Failed to find ANY working H.264 or HEVC decoder!");
 }
 
+// Ferry decoder cache: remembers, per (video decoder selection, video format),
+// the availability probed on this machine so subsequent connections can skip
+// re-creating test decoders. Stored in the portable Moonlight.ini (QSettings).
+// "This machine" is implied by the per-machine ini; the encoded video format is
+// part of the key. If the format changes the key misses and it re-probes.
+static QString ferryDecoderCacheKey(StreamingPreferences::VideoDecoderSelection vds, int videoFormat)
+{
+    return QStringLiteral("decodercache_%1_%2").arg((int)vds).arg(videoFormat);
+}
+
+static void ferryDecoderCacheWrite(StreamingPreferences::VideoDecoderSelection vds, int videoFormat, int value)
+{
+    QSettings settings;
+    settings.setValue(ferryDecoderCacheKey(vds, videoFormat), value);
+}
+
+static void ferryDecoderCacheClear(StreamingPreferences::VideoDecoderSelection vds, int videoFormat)
+{
+    QSettings settings;
+    settings.remove(ferryDecoderCacheKey(vds, videoFormat));
+}
+
 Session::DecoderAvailability
 Session::getDecoderAvailability(SDL_Window* window,
                                 StreamingPreferences::VideoDecoderSelection vds,
                                 int videoFormat, int width, int height, int frameRate)
 {
+    // Ferry: reuse a previously probed result instead of re-creating test
+    // decoders on every connection (the main per-connection probe cost).
+    if (FerryBridge::isEnabled()) {
+        QSettings settings;
+        QString key = ferryDecoderCacheKey(vds, videoFormat);
+        if (settings.contains(key)) {
+            int cached = settings.value(key).toInt();
+            if (cached >= (int)DecoderAvailability::None && cached <= (int)DecoderAvailability::Hardware) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Decoder availability cache hit (vds=%d, format=0x%x): %d",
+                            (int)vds, videoFormat, cached);
+                return (DecoderAvailability)cached;
+            }
+        }
+    }
+
     IVideoDecoder* decoder;
 
     if (!chooseDecoder(vds,
                        StreamingPreferences::RS_PROBE_ONLY,
                        window, videoFormat, width, height, frameRate,
                        false, false, true, decoder)) {
+        if (FerryBridge::isEnabled()) {
+            ferryDecoderCacheWrite(vds, videoFormat, (int)DecoderAvailability::None);
+        }
         return DecoderAvailability::None;
     }
 
@@ -508,7 +551,11 @@ Session::getDecoderAvailability(SDL_Window* window,
 
     delete decoder;
 
-    return hw ? DecoderAvailability::Hardware : DecoderAvailability::Software;
+    DecoderAvailability result = hw ? DecoderAvailability::Hardware : DecoderAvailability::Software;
+    if (FerryBridge::isEnabled()) {
+        ferryDecoderCacheWrite(vds, videoFormat, (int)result);
+    }
+    return result;
 }
 
 bool Session::populateDecoderProperties(SDL_Window* window)
@@ -1201,8 +1248,9 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         emitLaunchWarning(tr("Failed to open audio device. Audio will be unavailable during this session."));
     }
 
-    // Check for unmapped gamepads
-    if (!SdlInputHandler::getUnmappedGamepads().isEmpty()) {
+    // Check for unmapped gamepads (skipped in Ferry mode: the remote-desktop
+    // flow doesn't use gamepads, and this also loads the mapping DB).
+    if (!FerryBridge::isEnabled() && !SdlInputHandler::getUnmappedGamepads().isEmpty()) {
         emitLaunchWarning(tr("An attached gamepad has no mapping and won't be usable. Visit the Moonlight help to resolve this."));
     }
 
@@ -1733,6 +1781,11 @@ bool Session::startConnectionAsync()
         return false;
     }
 
+    // Ferry timing: the handshake completed (RTSP session established).
+    if (FerryBridge::isEnabled()) {
+        qInfo() << "[FerryTiming] connect_done ms=" << QDateTime::currentMSecsSinceEpoch();
+    }
+
     emit connectionStarted();
     return true;
 }
@@ -1769,6 +1822,11 @@ void Session::setShouldExit(bool quitHostApp)
 
 void Session::start()
 {
+    // Ferry timing: record when Moonlight begins the connection handshake.
+    if (FerryBridge::isEnabled()) {
+        qInfo() << "[FerryTiming] connect_start ms=" << QDateTime::currentMSecsSinceEpoch();
+    }
+
     // Wait for any old session to finish cleanup
     s_ActiveSessionSemaphore.acquire();
 
@@ -1919,6 +1977,13 @@ void Session::exec()
             m_Toolbar = nullptr;
         }
         FerryBridge::sendHello();
+        // Route Ferry -> Moonlight messages (transferProgress) to the toolbar.
+        // readMessages() is pumped from FerryToolbar::tick() during the SDL loop.
+        FerryBridge::setMessageHandler([this](const QJsonObject& obj) {
+            if (m_Toolbar != nullptr) {
+                m_Toolbar->handleTransferProgress(obj);
+            }
+        });
     }
 
     QSvgRenderer svgIconRenderer(QString(":/res/moonlight.svg"));
@@ -2006,6 +2071,7 @@ void Session::exec()
     // Hijack this thread to be the SDL main thread. We have to do this
     // because we want to suspend all Qt processing until the stream is over.
     SDL_Event event;
+    bool firstFrameLogged = false;
     for (;;) {
         // Ferry toolbar visibility (fullscreen reveal-on-top + follow).
         if (m_Toolbar != nullptr) {
@@ -2051,6 +2117,10 @@ void Session::exec()
         case SDL_USEREVENT:
             switch (event.user.code) {
             case SDL_CODE_FRAME_READY:
+                if (!firstFrameLogged && FerryBridge::isEnabled()) {
+                    firstFrameLogged = true;
+                    qInfo() << "[FerryTiming] first_frame ms=" << QDateTime::currentMSecsSinceEpoch();
+                }
                 if (m_VideoDecoder != nullptr) {
                     m_VideoDecoder->renderFrameOnMainThread();
                 }
@@ -2322,6 +2392,11 @@ void Session::exec()
                                    false,
                                    s_ActiveSession->m_VideoDecoder)) {
                     SDL_UnlockMutex(m_DecoderLock);
+                    // The decoder that was cached as available failed to open
+                    // for real; drop the cache so the next connection re-probes.
+                    if (FerryBridge::isEnabled()) {
+                        ferryDecoderCacheClear(m_Preferences->videoDecoderSelection, m_ActiveVideoFormat);
+                    }
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                                  "Failed to recreate decoder after reset");
                     emit displayLaunchError(tr("Unable to initialize video decoder. Please check your streaming settings and try again."));
@@ -2412,9 +2487,9 @@ void Session::exec()
                 }
 
                 FerryBridge::sendFiles(files, streamX, streamY, streamW, streamH);
-                if (m_Toolbar != nullptr) {
-                    m_Toolbar->setStatus(QStringLiteral("正在发送文件…"));
-                }
+                // Transfer progress is now shown on the toolbar's transfer
+                // button via Ferry's transferProgress messages, so no static
+                // "sending" text is needed here.
             }
             if (event.drop.file != nullptr) {
                 SDL_free(event.drop.file);
@@ -2495,6 +2570,8 @@ DispatchDeferredCleanup:
         delete m_Toolbar;
         m_Toolbar = nullptr;
     }
+    // Drop the message handler so the dangling Session pointer is never used.
+    FerryBridge::setMessageHandler(nullptr);
 
     // Raise any keys that are still down
     m_InputHandler->raiseAllKeys();

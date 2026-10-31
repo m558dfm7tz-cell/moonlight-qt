@@ -522,6 +522,12 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // top-right stats are available via Moonlight's own Ctrl+Alt+Shift+S.
     if (FerryBridge::isEnabled()) {
         preferences->showPerformanceOverlay = false;
+        // Suppress configuration warnings (e.g. the absolute-mouse / gamepad
+        // mapping toasts) so StreamSegue never waits ~3.5 s before starting the
+        // session. This matches Ferry writing confwarnings=false to the
+        // portable Moonlight.ini, but is enforced per-launch here so the very
+        // first run is already fast.
+        preferences->configurationWarnings = false;
     }
 
     // This method will not return and terminates the process if --version or

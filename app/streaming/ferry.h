@@ -3,6 +3,8 @@
 #include <QString>
 #include <QStringList>
 #include <QJsonObject>
+#include <QByteArray>
+#include <functional>
 
 class QTcpSocket;
 
@@ -15,7 +17,11 @@ class QTcpSocket;
 // Ferry (black-screen privacy, file transfer) and the "reconnect with a new
 // quality" handoff are routed through this channel rather than duplicated.
 //
-// The bridge is send-only: Moonlight never needs to read from Ferry here.
+// The loopback TCP socket is reused bidirectionally: Moonlight -> Ferry
+// (send(), below) and Ferry -> Moonlight (readMessages(), which dispatches
+// transferProgress updates to the toolbar). Because the Qt event loop is
+// suspended while streaming, readMessages() must be pumped manually from the
+// SDL event loop; readyRead signals will not be delivered.
 class FerryBridge
 {
 public:
@@ -44,8 +50,19 @@ public:
     // user is dragging a file OUT of the remote desktop back to this machine.
     static void sendDragOut();
 
+    // Register a handler for Ferry -> Moonlight messages (currently only
+    // transferProgress). Called on the main thread from readMessages().
+    static void setMessageHandler(const std::function<void(const QJsonObject&)>& handler);
+
+    // Non-blocking read of pending Ferry -> Moonlight lines. Must be called
+    // from the SDL event loop each iteration (see class comment).
+    static void readMessages();
+
 private:
     static QTcpSocket* socket();
     static QTcpSocket* s_socket;
     static bool s_connected;
+    static std::function<void(const QJsonObject&)> s_messageHandler;
+    static QByteArray s_readBuffer;
+    static qint64 s_lastDragOutMs; // de-duplicate rapid double dragout triggers
 };

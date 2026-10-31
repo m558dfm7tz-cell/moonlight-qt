@@ -13,26 +13,30 @@
 
 #include <QPair>
 #include <QHash>
+#include <QtGlobal>
 
 #define TOOLBAR_FONT_SIZE 13
-#define TOOLBAR_BAR_HEIGHT 34
-#define TOOLBAR_PAD_X 10
-#define TOOLBAR_PAD_Y 5
-#define TOOLBAR_GAP 4
 #define TOOLBAR_MARGIN 6
+#define TOOLBAR_GAP 4
+#define TOOLBAR_CELL 32
 #define TOOLBAR_STATUS_MS 6000
 #define TOOLBAR_FS_HIDE_MS 1500
+#define TOOLBAR_WIN_HIDE_MS 250
+#define TOOLBAR_TRANSFER_TIMEOUT 15000
+#define TOOLBAR_DONE_FLASH_MS 1000
+#define TOOLBAR_PROGRESS_W 48
+#define TOOLBAR_PROGRESS_H 40
+#define TOOLBAR_PROGRESS_THICK 6
 
 // Ferry dark-glass palette (mirrors the WPF settings / main window).
 static SDL_Color C_BAR_BG   = { 16, 27, 38, 255 };
-static SDL_Color C_BTN      = { 28, 40, 54, 255 };
-static SDL_Color C_BTN_HOV  = { 35, 71, 108, 255 };
+static SDL_Color C_HOVER    = { 35, 71, 108, 255 };
 static SDL_Color C_ACCENT   = { 37, 102, 179, 255 };
-static SDL_Color C_ACCENT_H = { 61, 131, 210, 255 };
 static SDL_Color C_DANGER   = { 186, 62, 52, 255 };
-static SDL_Color C_DANGER_H = { 228, 106, 96, 255 };
-static SDL_Color C_TEXT     = { 241, 246, 253, 255 };
+static SDL_Color C_ICON     = { 241, 246, 253, 255 };
 static SDL_Color C_MUTED    = { 149, 168, 185, 255 };
+static SDL_Color C_TRACK    = { 60, 70, 84, 255 };
+static SDL_Color C_FILL     = { 56, 200, 255, 255 };
 
 FerryToolbar::FerryToolbar(Session* session)
     : m_session(session),
@@ -41,7 +45,6 @@ FerryToolbar::FerryToolbar(Session* session)
       m_windowId(0),
       m_font(nullptr),
       m_fontSize(TOOLBAR_FONT_SIZE),
-      m_barHeight(TOOLBAR_BAR_HEIGHT),
       m_surfaceW(0),
       m_surfaceH(0),
       m_fullscreen(false),
@@ -57,11 +60,23 @@ FerryToolbar::FerryToolbar(Session* session)
       m_pendingFps(60),
       m_pendingBitrateMbps(20),
       m_pendingBitrateAuto(false),
-      m_visible(false),
-      m_lastTopTick(0),
+      m_dockEdge(DockTop),
+      m_expanded(true),
+      m_lastActivityTick(0),
+      m_dragging(false),
+      m_dragGrabX(0),
+      m_dragGrabY(0),
+      m_transferActive(false),
+      m_transferPercent(0),
+      m_lastTransferTick(0),
+      m_transferDoneTick(0),
+      m_showProgress(false),
+      m_progressVertical(false),
       m_lastTx(-1),
       m_lastTy(-1)
 {
+    m_progressTrack = { 0, 0, 0, 0 };
+    m_progressFill = { 0, 0, 0, 0 };
 #ifdef Q_OS_WIN32
     m_streamHwnd = nullptr;
 #endif
@@ -116,7 +131,8 @@ bool FerryToolbar::init(SDL_Window* streamWindow)
 
     m_window = SDL_CreateWindow("FerryRemoteToolbar",
                                 0, 0,
-                                400, TOOLBAR_BAR_HEIGHT + TOOLBAR_MARGIN * 2,
+                                TOOLBAR_CELL + TOOLBAR_MARGIN * 2,
+                                TOOLBAR_CELL + TOOLBAR_MARGIN * 2,
                                 SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_SKIP_TASKBAR);
     if (m_window == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Ferry toolbar window creation failed: %s", SDL_GetError());
@@ -152,6 +168,8 @@ bool FerryToolbar::init(SDL_Window* streamWindow)
     SDL_SetWindowsMessageHook(winMessageHook, this);
 #endif
 
+    m_lastActivityTick = SDL_GetTicks();
+
     return true;
 }
 
@@ -178,19 +196,27 @@ void FerryToolbar::destroy()
 void FerryToolbar::setFullscreen(bool fullscreen)
 {
     m_fullscreen = fullscreen;
-    syncLabels();
+    // Reset the reveal timer so the bar doesn't immediately collapse after a
+    // fullscreen toggle.
+    m_lastActivityTick = SDL_GetTicks();
     render();
 }
 
 void FerryToolbar::setFocused(bool focused)
 {
+    // Visibility no longer follows focus; it follows the pointer position.
+    // We still record the value so the session's existing calls remain
+    // harmless, and force a collapse when the stream window loses focus.
     m_focused = focused;
+    if (!focused && !m_dragging) {
+        m_expanded = false;
+        render();
+    }
 }
 
 void FerryToolbar::setPrivacy(bool on)
 {
     m_privacy = on;
-    syncLabels();
     render();
 }
 
@@ -211,6 +237,31 @@ void FerryToolbar::setQuality(const QString& resKey, int fps, int bitrateMbps, b
     m_pendingFps = fps;
     m_pendingBitrateMbps = bitrateMbps;
     m_pendingBitrateAuto = bitrateAuto;
+    render();
+}
+
+void FerryToolbar::handleTransferProgress(const QJsonObject& obj)
+{
+    if (obj.value("type").toString() != QLatin1String("transferProgress")) {
+        return;
+    }
+
+    const QString state = obj.value("state").toString();
+    if (state == QLatin1String("sending")) {
+        m_transferActive = true;
+        m_transferPercent = qBound(0, obj.value("percent").toInt(), 100);
+        m_lastTransferTick = SDL_GetTicks();
+    }
+    else if (state == QLatin1String("done") || state == QLatin1String("failed")) {
+        // Immediately remove the progress bar and "sending" state.
+        m_transferActive = false;
+        m_transferPercent = 0;
+        m_lastTransferTick = 0;
+        if (state == QLatin1String("done")) {
+            // Flash a brief completion hint (<= 1s), then revert.
+            m_transferDoneTick = SDL_GetTicks();
+        }
+    }
     render();
 }
 
@@ -244,94 +295,91 @@ FerryToolbar::Item* FerryToolbar::itemAt(int x, int y)
     return nullptr;
 }
 
-void FerryToolbar::syncLabels()
+QString FerryToolbar::qualityLabel() const
 {
-    if (Item* it = itemById(BtnFullscreen)) {
-        it->label = m_fullscreen ? QStringLiteral("退出全屏") : QStringLiteral("全屏");
-    }
-    if (Item* it = itemById(BtnPrivacy)) {
-        it->label = m_privacy ? QStringLiteral("恢复本机显示") : QStringLiteral("黑屏隐私");
-    }
-    if (Item* it = itemById(BtnQuality)) {
-        it->label = m_qualityOpen ? QStringLiteral("清晰度 ▴") : QStringLiteral("清晰度 ▾");
-    }
-}
-
-static QString resLabel(const QString& key)
-{
-    if (key == "remote") return QStringLiteral("对方屏幕");
-    if (key == "local")  return QStringLiteral("本机屏幕");
-    if (key == "720")    return QStringLiteral("720p");
-    if (key == "1080")   return QStringLiteral("1080p");
-    if (key == "1440")   return QStringLiteral("1440p");
-    if (key == "4K")     return QStringLiteral("4K");
-    return key;
+    if (m_resKey == "remote") return QStringLiteral("自动");
+    if (m_resKey == "local")  return QStringLiteral("本机");
+    if (m_resKey == "720")    return QStringLiteral("HD");
+    if (m_resKey == "1080")   return QStringLiteral("HD");
+    if (m_resKey == "1440")   return QStringLiteral("2K");
+    if (m_resKey == "4K")     return QStringLiteral("4K");
+    return QStringLiteral("HD");
 }
 
 void FerryToolbar::layout()
 {
     TTF_Font* font = (TTF_Font*)m_font;
-
     m_items.clear();
+    m_showProgress = false;
+    m_progressVertical = !isHorizontal();
 
-    QString peer = FerryBridge::peerName;
-    if (peer.isEmpty()) {
-        peer = QStringLiteral("Ferry");
-    }
-    if (peer.length() > 14) {
-        peer = peer.left(14) + QStringLiteral("…");
-    }
-    int peerNameW = textWidth(font, peer);
+    const int M = TOOLBAR_MARGIN;
+    const int C = TOOLBAR_CELL;
+    const int G = TOOLBAR_GAP;
+    const bool horiz = isHorizontal();
 
-    int btnY = TOOLBAR_MARGIN + TOOLBAR_PAD_Y;
-    int btnH = m_barHeight - TOOLBAR_PAD_Y * 2;
-    int x = TOOLBAR_MARGIN + 6 + peerNameW + 10;
+    if (!m_expanded) {
+        // Collapsed: just the drag handle.
+        Item it;
+        it.id = BtnDrag;
+        it.label = QString();
+        it.visible = true;
+        it.selected = false;
+        it.hover = false;
+        it.danger = false;
+        it.rect = { M, M, C, C };
+        m_items.append(it);
+        m_surfaceW = C + 2 * M;
+        m_surfaceH = C + 2 * M;
+        return;
+    }
+
+    int x = M;
+    int y = M;
 
     QVector<QPair<ButtonId, bool>> mainButtons; // (id, danger)
+    mainButtons.append(qMakePair(BtnDrag, false));
     mainButtons.append(qMakePair(BtnFullscreen, false));
     mainButtons.append(qMakePair(BtnPrivacy, false));
     mainButtons.append(qMakePair(BtnQuality, false));
+    mainButtons.append(qMakePair(BtnTransfer, false));
     mainButtons.append(qMakePair(BtnEnd, true));
 
     for (const auto& mb : mainButtons) {
-        QString label;
-        switch (mb.first) {
-        case BtnFullscreen: label = m_fullscreen ? QStringLiteral("退出全屏") : QStringLiteral("全屏"); break;
-        case BtnPrivacy:    label = m_privacy ? QStringLiteral("恢复本机显示") : QStringLiteral("黑屏隐私"); break;
-        case BtnQuality:    label = m_qualityOpen ? QStringLiteral("清晰度 ▴") : QStringLiteral("清晰度 ▾"); break;
-        case BtnEnd:        label = QStringLiteral("结束远程"); break;
-        default: label = QString(); break;
-        }
-        int w = textWidth(font, label) + TOOLBAR_PAD_X * 2;
         Item it;
         it.id = mb.first;
-        it.label = label;
+        it.label = (mb.first == BtnQuality) ? qualityLabel() : QString();
         it.visible = true;
         it.selected = false;
         it.hover = false;
         it.danger = mb.second;
-        it.rect = { x, btnY, w, btnH };
+        it.rect = { x, y, C, C };
         m_items.append(it);
-        x += w + TOOLBAR_GAP;
+
+        if (horiz) x += C + G;
+        else y += C + G;
+
+        // Reserve inline space for the transfer progress bar.
+        if (mb.first == BtnTransfer && m_transferActive) {
+            if (horiz) x += TOOLBAR_PROGRESS_W + G;
+            else y += TOOLBAR_PROGRESS_H + G;
+        }
     }
 
-    int totalW = x + TOOLBAR_MARGIN;
-    int totalH = TOOLBAR_MARGIN + m_barHeight + TOOLBAR_MARGIN;
+    int mainW = horiz ? (x - G + M) : (C + 2 * M);
+    int mainH = horiz ? (C + 2 * M) : (y - G + M);
 
-    if (!m_status.isEmpty() && SDL_GetTicks() - m_statusTick < TOOLBAR_STATUS_MS) {
-        int sw = textWidth(font, m_status);
-        totalH += 22;
-        if (sw + 24 > totalW) totalW = sw + 24;
-    }
-    else {
-        m_status.clear();
-    }
+    m_surfaceW = mainW;
+    m_surfaceH = mainH;
 
     if (m_qualityOpen) {
-        int px = TOOLBAR_MARGIN + 8;
-        int py = TOOLBAR_MARGIN + m_barHeight + 6;
-        int rowH = 26;
-        int titleW = 44;
+        // Chip panel appended below the main bar (horizontal layout for the
+        // chips, regardless of dock orientation).
+        const int rowH = 26;
+        const int titleW = 44;
+        int px = M + 8;
+        int py = M + C + 6;
+        int cursor = py;
 
         struct ChipRow { const char* title; QVector<QPair<ButtonId, const char*>> chips; };
         QVector<ChipRow> rows;
@@ -351,7 +399,7 @@ void FerryToolbar::layout()
             int cx = px + titleW + 6;
             for (const auto& chip : row.chips) {
                 QString label = QString::fromUtf8(chip.second);
-                int w = textWidth(font, label) + TOOLBAR_PAD_X * 2;
+                int w = textWidth(font, label) + 12;
                 Item it;
                 it.id = chip.first;
                 it.label = label;
@@ -359,15 +407,14 @@ void FerryToolbar::layout()
                 it.selected = false;
                 it.hover = false;
                 it.danger = false;
-                it.rect = { cx, py, w, rowH };
+                it.rect = { cx, cursor, w, rowH };
                 m_items.append(it);
-                cx += w + TOOLBAR_GAP;
+                cx += w + G;
             }
-            if (cx > totalW) totalW = cx + TOOLBAR_MARGIN;
-            py += rowH + 4;
+            if (cx > m_surfaceW) m_surfaceW = cx + M;
+            cursor += rowH + 4;
         }
 
-        int ax = px + titleW + 6;
         Item apply;
         apply.id = BtnApply;
         apply.label = QStringLiteral("应用并重连");
@@ -375,9 +422,9 @@ void FerryToolbar::layout()
         apply.selected = false;
         apply.hover = false;
         apply.danger = false;
-        apply.rect = { ax, py, textWidth(font, apply.label) + TOOLBAR_PAD_X * 2, rowH };
+        int ax = px + titleW + 6;
+        apply.rect = { ax, cursor, textWidth(font, apply.label) + 12, rowH };
         m_items.append(apply);
-        ax += apply.rect.w + TOOLBAR_GAP;
 
         Item cancel;
         cancel.id = BtnCancel;
@@ -386,15 +433,14 @@ void FerryToolbar::layout()
         cancel.selected = false;
         cancel.hover = false;
         cancel.danger = false;
-        cancel.rect = { ax, py, textWidth(font, cancel.label) + TOOLBAR_PAD_X * 2, rowH };
+        cancel.rect = { apply.rect.x + apply.rect.w + G, cursor, textWidth(font, cancel.label) + 12, rowH };
         m_items.append(cancel);
-        ax += cancel.rect.w + TOOLBAR_GAP;
-        if (ax > totalW) totalW = ax + TOOLBAR_MARGIN;
-        totalH = py + rowH + TOOLBAR_MARGIN;
-    }
 
-    m_surfaceW = totalW;
-    m_surfaceH = totalH;
+        int endX = cancel.rect.x + cancel.rect.w + M;
+        int endY = cancel.rect.y + cancel.rect.h + M;
+        if (endX > m_surfaceW) m_surfaceW = endX;
+        if (endY > m_surfaceH) m_surfaceH = endY;
+    }
 
     auto sel = [&](ButtonId id) {
         if (Item* it = itemById(id)) it->selected = true;
@@ -419,6 +465,119 @@ void FerryToolbar::layout()
     }
 }
 
+void FerryToolbar::putPixel(SDL_Surface* dst, int x, int y, SDL_Color c)
+{
+    if (dst == nullptr || x < 0 || y < 0 || x >= dst->w || y >= dst->h) {
+        return;
+    }
+    SDL_Rect r = { x, y, 1, 1 };
+    SDL_FillRect(dst, &r, SDL_MapRGBA(dst->format, c.r, c.g, c.b, c.a));
+}
+
+void FerryToolbar::drawLine(SDL_Surface* dst, int x0, int y0, int x1, int y1, SDL_Color c)
+{
+    int dx = qAbs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -qAbs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        putPixel(dst, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+void FerryToolbar::fillCircle(SDL_Surface* dst, int cx, int cy, int r, SDL_Color c)
+{
+    for (int y = -r; y <= r; y++) {
+        for (int x = -r; x <= r; x++) {
+            if (x * x + y * y <= r * r) {
+                putPixel(dst, cx + x, cy + y, c);
+            }
+        }
+    }
+}
+
+void FerryToolbar::fillRoundedRect(SDL_Surface* dst, const SDL_Rect& r, int radius, SDL_Color c)
+{
+    int rr = qMin(radius, qMin(r.w, r.h) / 2);
+    if (rr <= 0) {
+        SDL_FillRect(dst, &r, SDL_MapRGBA(dst->format, c.r, c.g, c.b, c.a));
+        return;
+    }
+    for (int y = 0; y < r.h; y++) {
+        for (int x = 0; x < r.w; x++) {
+            int dx = 0, dy = 0;
+            if (x < rr) dx = rr - x;
+            else if (x >= r.w - rr) dx = x - (r.w - rr - 1);
+            if (y < rr) dy = rr - y;
+            else if (y >= r.h - rr) dy = y - (r.h - rr - 1);
+            if (dx * dx + dy * dy <= rr * rr) {
+                putPixel(dst, r.x + x, r.y + y, c);
+            }
+        }
+    }
+}
+
+void FerryToolbar::drawIcon(SDL_Surface* dst, ButtonId id, const SDL_Rect& r, SDL_Color c)
+{
+    int cx = r.x + r.w / 2;
+    int cy = r.y + r.h / 2;
+    const int s = 8; // half-size of the icon
+
+    switch (id) {
+    case BtnDrag:
+        // 6-dot grip: 3 columns x 2 rows.
+        for (int col = 0; col < 3; col++) {
+            for (int row = 0; row < 2; row++) {
+                fillCircle(dst, cx - 6 + col * 6, cy - 3 + row * 6, 1, c);
+            }
+        }
+        break;
+
+    case BtnFullscreen:
+        // Four corner brackets (outward-facing).
+        drawLine(dst, cx - s, cy - s + 3, cx - s, cy - s, c);
+        drawLine(dst, cx - s, cy - s, cx - s + 3, cy - s, c);
+        drawLine(dst, cx + s - 3, cy - s, cx + s, cy - s, c);
+        drawLine(dst, cx + s, cy - s, cx + s, cy - s + 3, c);
+        drawLine(dst, cx - s, cy + s - 3, cx - s, cy + s, c);
+        drawLine(dst, cx - s, cy + s, cx - s + 3, cy + s, c);
+        drawLine(dst, cx + s - 3, cy + s, cx + s, cy + s, c);
+        drawLine(dst, cx + s, cy + s, cx + s, cy + s - 3, c);
+        break;
+
+    case BtnPrivacy:
+        // Eye outline (lens shape) with a diagonal slash through it.
+        drawLine(dst, cx - s, cy, cx, cy - s, c);
+        drawLine(dst, cx, cy - s, cx + s, cy, c);
+        drawLine(dst, cx + s, cy, cx, cy + s, c);
+        drawLine(dst, cx, cy + s, cx - s, cy, c);
+        drawLine(dst, cx - s, cy + s, cx + s, cy - s, c);
+        break;
+
+    case BtnTransfer:
+        // Up arrow above a base tray.
+        drawLine(dst, cx, cy - s, cx, cy + 2, c);
+        drawLine(dst, cx - 4, cy - 4, cx, cy - s, c);
+        drawLine(dst, cx, cy - s, cx + 4, cy - 4, c);
+        drawLine(dst, cx - 6, cy + s, cx + 6, cy + s, c);
+        break;
+
+    case BtnEnd:
+        // Cross.
+        drawLine(dst, cx - s, cy - s, cx + s, cy + s, c);
+        drawLine(dst, cx + s, cy - s, cx - s, cy + s, c);
+        break;
+
+    default:
+        break;
+    }
+}
+
 void FerryToolbar::blitText(SDL_Surface* dst, const QString& text, SDL_Color color, int x, int y)
 {
     TTF_Font* font = (TTF_Font*)m_font;
@@ -433,22 +592,6 @@ void FerryToolbar::blitText(SDL_Surface* dst, const QString& text, SDL_Color col
     SDL_Rect dr = { x, y, s->w, s->h };
     SDL_BlitSurface(s, nullptr, dst, &dr);
     SDL_FreeSurface(s);
-}
-
-void FerryToolbar::drawButton(SDL_Surface* dst, const Item& item)
-{
-    if (!item.visible) {
-        return;
-    }
-    SDL_Color bg = item.danger ? (item.hover ? C_DANGER_H : C_DANGER)
-                               : (item.selected ? (item.hover ? C_ACCENT_H : C_ACCENT)
-                                                : (item.hover ? C_BTN_HOV : C_BTN));
-    SDL_FillRect(dst, &item.rect, SDL_MapRGBA(dst->format, bg.r, bg.g, bg.b, bg.a));
-
-    int tw = textWidth((TTF_Font*)m_font, item.label);
-    int tx = item.rect.x + (item.rect.w - tw) / 2;
-    int ty = item.rect.y + (item.rect.h - m_fontSize - 2) / 2;
-    blitText(dst, item.label, C_TEXT, tx, ty);
 }
 
 void FerryToolbar::render()
@@ -481,40 +624,115 @@ void FerryToolbar::render()
 
     SDL_FillRect(surface, nullptr, SDL_MapRGBA(surface->format, C_BAR_BG.r, C_BAR_BG.g, C_BAR_BG.b, C_BAR_BG.a));
 
-    QString peer = FerryBridge::peerName;
-    if (peer.isEmpty()) {
-        peer = QStringLiteral("Ferry");
-    }
-    if (peer.length() > 14) {
-        peer = peer.left(14) + QStringLiteral("…");
-    }
-    int nameY = TOOLBAR_MARGIN + (m_barHeight - m_fontSize - 2) / 2;
-    blitText(surface, peer, C_MUTED, TOOLBAR_MARGIN + 6, nameY);
-
+    // Buttons (icons + hover highlight + quality "HD" text).
     for (const Item& item : m_items) {
-        drawButton(surface, item);
-    }
-
-    if (!m_status.isEmpty()) {
-        int sy = TOOLBAR_MARGIN + m_barHeight + 4;
-        blitText(surface, m_status, C_MUTED, TOOLBAR_MARGIN + 8, sy);
-    }
-
-    if (m_qualityOpen) {
-        int titleX = TOOLBAR_MARGIN + 8;
-        int titleW = 44;
-        int rowH = 26;
-        int py = TOOLBAR_MARGIN + m_barHeight + 6;
-        const char* titles[3] = { "分辨率", "帧率", "码率" };
-        for (int i = 0; i < 3; i++) {
-            blitText(surface, QString::fromUtf8(titles[i]), C_MUTED, titleX, py + (rowH - m_fontSize - 2) / 2);
-            py += rowH + 4;
+        if (!item.visible) {
+            continue;
         }
+
+        // Subtle rounded highlight on hover (or selected chip).
+        if (item.hover || item.selected) {
+            SDL_Color bg = item.danger ? C_DANGER : (item.selected ? C_ACCENT : C_HOVER);
+            SDL_Rect hi = { item.rect.x + 1, item.rect.y + 1, item.rect.w - 2, item.rect.h - 2 };
+            fillRoundedRect(surface, hi, 6, bg);
+        }
+
+        if (item.id == BtnQuality) {
+            int tw = textWidth((TTF_Font*)m_font, item.label);
+            int tx = item.rect.x + (item.rect.w - tw) / 2;
+            int ty = item.rect.y + (item.rect.h - m_fontSize - 2) / 2;
+            blitText(surface, item.label, C_ICON, tx, ty);
+        }
+        else if (item.id != BtnResRemote && item.id != BtnResLocal &&
+                 item.id != BtnRes720 && item.id != BtnRes1080 &&
+                 item.id != BtnRes1440 && item.id != BtnRes4K &&
+                 item.id != BtnFps30 && item.id != BtnFps60 && item.id != BtnFps120 &&
+                 item.id != BtnRateAuto && item.id != BtnRate10 && item.id != BtnRate20 &&
+                 item.id != BtnRate40 && item.id != BtnRate80 &&
+                 item.id != BtnApply && item.id != BtnCancel) {
+            drawIcon(surface, item.id, item.rect, C_ICON);
+        }
+        else {
+            // Text chip (quality panel).
+            int tw = textWidth((TTF_Font*)m_font, item.label);
+            int tx = item.rect.x + (item.rect.w - tw) / 2;
+            int ty = item.rect.y + (item.rect.h - m_fontSize - 2) / 2;
+            blitText(surface, item.label, C_ICON, tx, ty);
+        }
+    }
+
+    // Transfer progress bar, adjacent to the transfer button.
+    m_showProgress = false;
+    if (m_transferActive || (SDL_GetTicks() - m_transferDoneTick) < TOOLBAR_DONE_FLASH_MS) {
+        if (Item* transfer = itemById(BtnTransfer)) {
+            m_showProgress = true;
+            m_progressVertical = !isHorizontal();
+            const bool flashDone = !m_transferActive;
+
+            if (m_progressVertical) {
+                // Vertical bar below the transfer icon (only when expanded and docked left/right).
+                m_progressTrack = { transfer->rect.x + (transfer->rect.w - TOOLBAR_PROGRESS_THICK) / 2,
+                                    transfer->rect.y + transfer->rect.h + 4,
+                                    TOOLBAR_PROGRESS_THICK, TOOLBAR_PROGRESS_H };
+            }
+            else {
+                m_progressTrack = { transfer->rect.x + transfer->rect.w + 4,
+                                    transfer->rect.y + (transfer->rect.h - TOOLBAR_PROGRESS_THICK) / 2,
+                                    TOOLBAR_PROGRESS_W, TOOLBAR_PROGRESS_THICK };
+            }
+
+            SDL_FillRect(surface, &m_progressTrack, SDL_MapRGBA(surface->format, C_TRACK.r, C_TRACK.g, C_TRACK.b, C_TRACK.a));
+
+            int percent = flashDone ? 100 : m_transferPercent;
+            if (m_progressVertical) {
+                int filled = m_progressTrack.h * percent / 100;
+                SDL_Rect fill = { m_progressTrack.x,
+                                  m_progressTrack.y + (m_progressTrack.h - filled),
+                                  m_progressTrack.w, filled };
+                m_progressFill = fill;
+                SDL_FillRect(surface, &fill, SDL_MapRGBA(surface->format, C_FILL.r, C_FILL.g, C_FILL.b, C_FILL.a));
+            }
+            else {
+                int filled = m_progressTrack.w * percent / 100;
+                SDL_Rect fill = { m_progressTrack.x, m_progressTrack.y, filled, m_progressTrack.h };
+                m_progressFill = fill;
+                SDL_FillRect(surface, &fill, SDL_MapRGBA(surface->format, C_FILL.r, C_FILL.g, C_FILL.b, C_FILL.a));
+            }
+
+            if (!flashDone) {
+                QString pct = QString::number(m_transferPercent) + "%";
+                int tw = textWidth((TTF_Font*)m_font, pct);
+                if (m_progressVertical) {
+                    blitText(surface, pct, C_ICON, m_progressTrack.x + (m_progressTrack.w - tw) / 2,
+                             m_progressTrack.y - m_fontSize - 4);
+                }
+                else {
+                    blitText(surface, pct, C_ICON, m_progressTrack.x + (m_progressTrack.w - tw) / 2,
+                             m_progressTrack.y + m_progressTrack.h + 2);
+                }
+            }
+        }
+    }
+
+    // Status line (informational, e.g. "正在发送文件…" has been replaced by
+    // the progress bar, so this is only used for transient messages).
+    if (!m_status.isEmpty() && (SDL_GetTicks() - m_statusTick) < TOOLBAR_STATUS_MS) {
+        int sx = TOOLBAR_MARGIN + 8;
+        int sy = TOOLBAR_MARGIN + TOOLBAR_CELL + 4;
+        blitText(surface, m_status, C_MUTED, sx, sy);
+    }
+    else {
+        m_status.clear();
     }
 
     SDL_UpdateWindowSurface(m_window);
 
     setShape();
+
+    // Re-dock immediately after a resize (e.g. the progress bar or quality
+    // panel changed the surface size) so the bar doesn't sit at a stale spot
+    // until the next tick().
+    follow();
 }
 
 void FerryToolbar::setShape()
@@ -523,10 +741,6 @@ void FerryToolbar::setShape()
         return;
     }
 
-    // Ferry dark-glass style: rounded corners. SDL_SetWindowShape treats the
-    // shape surface's alpha channel as a per-pixel mask, so the corners are
-    // transparent and the rest opaque. Combined with SDL_SetWindowOpacity this
-    // matches the semi-transparent rounded cards of the main Ferry UI.
     const int radius = 10;
     SDL_Surface* shape = SDL_CreateRGBSurfaceWithFormat(0, m_surfaceW, m_surfaceH, 32, SDL_PIXELFORMAT_ARGB8888);
     if (shape == nullptr) {
@@ -553,33 +767,19 @@ void FerryToolbar::setShape()
     SDL_FreeSurface(shape);
 }
 
-void FerryToolbar::follow()
+void FerryToolbar::computeClientRect(int& cx, int& cy, int& cw, int& ch)
 {
-    if (m_window == nullptr || m_streamWindow == nullptr) {
-        return;
-    }
-    if (!m_visible) {
-        return;
-    }
-    int wx, wy, ww, wh;
-    SDL_GetWindowPosition(m_streamWindow, &wx, &wy);
-    SDL_GetWindowSize(m_streamWindow, &ww, &wh);
-    followTo(wx, wy, ww);
-}
+    cx = 0;
+    cy = 0;
+    cw = 0;
+    ch = 0;
 
-void FerryToolbar::followTo(int wx, int wy, int ww)
-{
-    if (m_window == nullptr || m_streamWindow == nullptr) {
-        return;
-    }
-    if (!m_visible) {
+    if (m_streamWindow == nullptr) {
         return;
     }
 
-    // Start from the outer window rect passed in (wx/wy are the frame origin).
-    int cx = wx;
-    int cw = ww;
-    int cy = wy;
+    SDL_GetWindowPosition(m_streamWindow, &cx, &cy);
+    SDL_GetWindowSize(m_streamWindow, &cw, &ch);
 
 #ifdef Q_OS_WIN32
     // Keep the toolbar inside the stream window's CLIENT area (the video
@@ -595,19 +795,117 @@ void FerryToolbar::followTo(int wx, int wy, int ww)
                 cx = pt.x;
                 cy = pt.y;
                 cw = rc.right - rc.left;
+                ch = rc.bottom - rc.top;
             }
         }
     }
 #endif
+}
 
-    int tx = cx + (cw - m_surfaceW) / 2;
+void FerryToolbar::reposition(int cx, int cy, int cw, int ch)
+{
+    if (m_window == nullptr || m_streamWindow == nullptr) {
+        return;
+    }
+
+    const int margin = 2;
+    int tx = cx;
+    int ty = cy;
+
+    switch (m_dockEdge) {
+    case DockTop:
+        tx = cx + (cw - m_surfaceW) / 2;
+        ty = cy + margin;
+        break;
+    case DockBottom:
+        tx = cx + (cw - m_surfaceW) / 2;
+        ty = cy + ch - m_surfaceH - margin;
+        break;
+    case DockLeft:
+        tx = cx + margin;
+        ty = cy + (ch - m_surfaceH) / 2;
+        break;
+    case DockRight:
+        tx = cx + cw - m_surfaceW - margin;
+        ty = cy + (ch - m_surfaceH) / 2;
+        break;
+    }
+
+    // Clamp inside the client area.
     if (tx < cx) tx = cx;
-    int ty = cy + 2;
+    if (ty < cy) ty = cy;
+    if (tx + m_surfaceW > cx + cw) tx = cx + cw - m_surfaceW;
+    if (ty + m_surfaceH > cy + ch) ty = cy + ch - m_surfaceH;
+    if (tx < cx) tx = cx;
+    if (ty < cy) ty = cy;
+
     if (tx != m_lastTx || ty != m_lastTy) {
         SDL_SetWindowPosition(m_window, tx, ty);
         m_lastTx = tx;
         m_lastTy = ty;
     }
+}
+
+void FerryToolbar::follow()
+{
+    if (m_window == nullptr || m_streamWindow == nullptr) {
+        return;
+    }
+    if (m_dragging) {
+        return;
+    }
+    int cx, cy, cw, ch;
+    computeClientRect(cx, cy, cw, ch);
+    reposition(cx, cy, cw, ch);
+}
+
+void FerryToolbar::followTo(int wx, int wy, int ww)
+{
+    (void)wx;
+    (void)wy;
+    if (m_window == nullptr || m_streamWindow == nullptr) {
+        return;
+    }
+    if (m_dragging) {
+        return;
+    }
+    int cx, cy, cw, ch;
+    computeClientRect(cx, cy, cw, ch);
+    // The hook gives us the outer frame rect; prefer the client rect above,
+    // but fall back to the passed values if the client rect is unavailable.
+    if (cw <= 0 || ch <= 0) {
+        cw = ww;
+    }
+    reposition(cx, cy, cw, ch);
+}
+
+void FerryToolbar::dockToNearestEdge()
+{
+    int cx, cy, cw, ch;
+    computeClientRect(cx, cy, cw, ch);
+    if (cw <= 0 || ch <= 0) {
+        return;
+    }
+
+    int wx, wy;
+    SDL_GetWindowPosition(m_window, &wx, &wy);
+    int tx = wx + m_surfaceW / 2;
+    int ty = wy + m_surfaceH / 2;
+
+    // Distance to each edge.
+    int dTop = ty - cy;
+    int dBottom = (cy + ch) - ty;
+    int dLeft = tx - cx;
+    int dRight = (cx + cw) - tx;
+    int dMin = qMin(qMin(dTop, dBottom), qMin(dLeft, dRight));
+
+    if (dMin == dTop) m_dockEdge = DockTop;
+    else if (dMin == dBottom) m_dockEdge = DockBottom;
+    else if (dMin == dLeft) m_dockEdge = DockLeft;
+    else m_dockEdge = DockRight;
+
+    render();
+    reposition(cx, cy, cw, ch);
 }
 
 #ifdef Q_OS_WIN32
@@ -640,33 +938,89 @@ void FerryToolbar::tick()
         return;
     }
 
-    bool show = m_focused;
+    // Let Ferry push transferProgress updates into the toolbar.
+    FerryBridge::readMessages();
 
-    if (m_fullscreen && show) {
-        int mouseX, mouseY;
-        SDL_GetGlobalMouseState(&mouseX, &mouseY);
-        int wx, wy;
-        SDL_GetWindowPosition(m_streamWindow, &wx, &wy);
-        Uint32 now = SDL_GetTicks();
-        if (mouseY <= wy + m_barHeight + 8 && mouseX >= wx && mouseX <= wx + m_surfaceW) {
-            m_lastTopTick = now;
-        }
-        show = (now - m_lastTopTick) < TOOLBAR_FS_HIDE_MS;
+    // Timeout for a stuck "sending" state.
+    if (m_transferActive && (SDL_GetTicks() - m_lastTransferTick) > TOOLBAR_TRANSFER_TIMEOUT) {
+        m_transferActive = false;
+        m_transferPercent = 0;
+        render();
     }
 
-    if (show != m_visible) {
-        m_visible = show;
-        if (show) {
-            SDL_ShowWindow(m_window);
+    int mouseX, mouseY;
+    Uint32 buttons = SDL_GetGlobalMouseState(&mouseX, &mouseY);
+
+    // Toolbar window rect (global).
+    int wx, wy, ww, wh;
+    SDL_GetWindowPosition(m_window, &wx, &wy);
+    SDL_GetWindowSize(m_window, &ww, &wh);
+
+    // Stream client rect (global).
+    int cx, cy, cw, ch;
+    computeClientRect(cx, cy, cw, ch);
+
+    Uint32 now = SDL_GetTicks();
+
+    // Dragging: move the toolbar with the pointer. We also detect the release
+    // here from the global button state, so the drag ends cleanly even if the
+    // pointer has moved off the toolbar window (where the button-up would not
+    // be delivered).
+    if (m_dragging) {
+        if (!(buttons & SDL_BUTTON(SDL_BUTTON_LEFT))) {
+            m_dragging = false;
+            SDL_CaptureMouse(SDL_FALSE);
+            dockToNearestEdge();
+            return;
+        }
+        int nx = mouseX - m_dragGrabX;
+        int ny = mouseY - m_dragGrabY;
+        if (nx != m_lastTx || ny != m_lastTy) {
+            SDL_SetWindowPosition(m_window, nx, ny);
+            m_lastTx = nx;
+            m_lastTy = ny;
+        }
+        return;
+    }
+
+    // Determine whether the pointer is over the toolbar (expanded rect) or,
+    // when collapsed, over the handle.
+    bool overToolbar = (mouseX >= wx && mouseX < wx + ww && mouseY >= wy && mouseY < wy + wh);
+
+    // In fullscreen, also treat the middle of the docked edge as a reveal zone
+    // so the bar can be summoned even if the handle is not hit exactly.
+    bool overRevealZone = false;
+    if (m_fullscreen && !m_expanded) {
+        const int zone = 14;
+        switch (m_dockEdge) {
+        case DockTop:    overRevealZone = (mouseY <= cy + zone); break;
+        case DockBottom: overRevealZone = (mouseY >= cy + ch - zone); break;
+        case DockLeft:   overRevealZone = (mouseX <= cx + zone); break;
+        case DockRight:  overRevealZone = (mouseX >= cx + cw - zone); break;
+        }
+    }
+
+    bool shouldExpand = overToolbar || overRevealZone;
+
+    if (shouldExpand) {
+        m_lastActivityTick = now;
+        if (!m_expanded) {
+            m_expanded = true;
+            render();
             follow();
         }
-        else {
-            SDL_HideWindow(m_window);
+    }
+    else {
+        // Collapse after a short delay.
+        Uint32 hideMs = m_fullscreen ? TOOLBAR_FS_HIDE_MS : TOOLBAR_WIN_HIDE_MS;
+        if (m_expanded && (now - m_lastActivityTick) > hideMs) {
+            m_expanded = false;
+            render();
+            follow();
         }
     }
-    else if (show) {
-        follow();
-    }
+
+    follow();
 }
 
 bool FerryToolbar::handleMouseButton(const SDL_MouseButtonEvent* ev)
@@ -674,13 +1028,35 @@ bool FerryToolbar::handleMouseButton(const SDL_MouseButtonEvent* ev)
     if (m_window == nullptr) {
         return false;
     }
-    if (ev->state == SDL_PRESSED && ev->button == SDL_BUTTON_LEFT) {
+
+    if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button == SDL_BUTTON_LEFT) {
         Item* item = itemAt(ev->x, ev->y);
         if (item != nullptr) {
             item->hover = true;
-            onButton(item->id);
+            if (item->id == BtnDrag) {
+                // Begin dragging the toolbar.
+                int gx, gy;
+                SDL_GetGlobalMouseState(&gx, &gy);
+                int wx, wy;
+                SDL_GetWindowPosition(m_window, &wx, &wy);
+                m_dragging = true;
+                m_dragGrabX = gx - wx;
+                m_dragGrabY = gy - wy;
+                SDL_CaptureMouse(SDL_TRUE);
+            }
+            else {
+                onButton(item->id);
+            }
         }
     }
+    else if (ev->type == SDL_MOUSEBUTTONUP && ev->button == SDL_BUTTON_LEFT) {
+        if (m_dragging) {
+            m_dragging = false;
+            SDL_CaptureMouse(SDL_FALSE);
+            dockToNearestEdge();
+        }
+    }
+
     // Clicks inside the toolbar window are always consumed.
     return true;
 }
@@ -690,6 +1066,12 @@ bool FerryToolbar::handleMouseMotion(const SDL_MouseMotionEvent* ev)
     if (m_window == nullptr) {
         return false;
     }
+
+    if (m_dragging) {
+        // Reposition is handled in tick() using the global pointer position.
+        return true;
+    }
+
     Item* hit = itemAt(ev->x, ev->y);
     bool changed = false;
     for (Item& item : m_items) {
@@ -697,9 +1079,6 @@ bool FerryToolbar::handleMouseMotion(const SDL_MouseMotionEvent* ev)
         if (item.hover != hov) changed = true;
         item.hover = hov;
     }
-    // Only re-render when the hovered item actually changes. Re-rendering the
-    // whole bar (text layout + surface blit) on every motion event while the
-    // pointer is near/over the toolbar caused a visible stutter.
     if (changed) {
         render();
     }
@@ -709,6 +1088,10 @@ bool FerryToolbar::handleMouseMotion(const SDL_MouseMotionEvent* ev)
 void FerryToolbar::onButton(ButtonId id)
 {
     switch (id) {
+    case BtnDrag:
+        // Dragging is handled in handleMouseButton.
+        break;
+
     case BtnFullscreen:
         if (m_session != nullptr) {
             m_session->toggleFullscreen();
@@ -718,7 +1101,6 @@ void FerryToolbar::onButton(ButtonId id)
     case BtnPrivacy:
         m_privacy = !m_privacy;
         FerryBridge::sendBlank(m_privacy);
-        syncLabels();
         render();
         break;
 
@@ -728,8 +1110,12 @@ void FerryToolbar::onButton(ButtonId id)
         m_pendingFps = m_fps;
         m_pendingBitrateMbps = m_bitrateMbps;
         m_pendingBitrateAuto = m_bitrateAuto;
-        syncLabels();
         render();
+        break;
+
+    case BtnTransfer:
+        // The transfer button itself has no action; files are dropped onto the
+        // stream window. Progress is driven by Ferry's transferProgress.
         break;
 
     case BtnEnd:
@@ -769,7 +1155,6 @@ void FerryToolbar::onButton(ButtonId id)
         m_bitrateMbps = m_pendingBitrateMbps;
         m_bitrateAuto = m_pendingBitrateAuto;
         m_qualityOpen = false;
-        syncLabels();
         render();
         FerryBridge::sendReconnect(m_resKey, m_fps, m_bitrateMbps, m_bitrateAuto);
         break;
@@ -780,7 +1165,6 @@ void FerryToolbar::onButton(ButtonId id)
         m_pendingFps = m_fps;
         m_pendingBitrateMbps = m_bitrateMbps;
         m_pendingBitrateAuto = m_bitrateAuto;
-        syncLabels();
         render();
         break;
 
