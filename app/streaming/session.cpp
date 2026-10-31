@@ -2159,6 +2159,13 @@ void Session::exec()
             }
         }
 
+            // The toolbar is a separate SDL window that resizes itself (e.g. when
+            // the status line or quality panel opens). Its own size/display events
+            // must never trigger the renderer recreation below.
+            if (event.window.windowID != SDL_GetWindowID(m_Window)) {
+                break;
+            }
+
             presence.runCallbacks();
 
             // Capture the mouse on SDL_WINDOWEVENT_ENTER if needed
