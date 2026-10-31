@@ -14,41 +14,56 @@
 #include <QPair>
 #include <QHash>
 #include <QtGlobal>
+#include <QtMath>
+#include <cmath>
 
+// Logical sizes (scaled by devicePixelRatio at layout/render time).
 #define TOOLBAR_FONT_SIZE 13
-#define TOOLBAR_MARGIN 6
+#define TOOLBAR_MARGIN 8
 #define TOOLBAR_GAP 4
-#define TOOLBAR_CELL 32
+#define TOOLBAR_CELL 40
+#define TOOLBAR_ICON 26
+#define TOOLBAR_COLLAPSED_RADIUS 13
 #define TOOLBAR_STATUS_MS 6000
 #define TOOLBAR_FS_HIDE_MS 1500
 #define TOOLBAR_WIN_HIDE_MS 250
 #define TOOLBAR_TRANSFER_TIMEOUT 15000
 #define TOOLBAR_DONE_FLASH_MS 1000
-#define TOOLBAR_PROGRESS_W 48
-#define TOOLBAR_PROGRESS_H 40
+#define TOOLBAR_PROGRESS_W 56
+#define TOOLBAR_PROGRESS_H 44
 #define TOOLBAR_PROGRESS_THICK 6
-#define TOOLBAR_SEP_W 9
-#define TOOLBAR_SEP_H 9
+#define TOOLBAR_SEP_W 8
+#define TOOLBAR_SEP_H 8
 
-// Ferry dark-glass palette (mirrors the WPF settings / main window).
-static SDL_Color C_BAR_BG   = { 16, 27, 38, 255 };
-static SDL_Color C_HOVER    = { 35, 71, 108, 255 };
-static SDL_Color C_ACCENT   = { 37, 102, 179, 255 };
-static SDL_Color C_DANGER   = { 186, 62, 52, 255 };
-static SDL_Color C_ICON     = { 241, 246, 253, 255 };
-static SDL_Color C_MUTED    = { 149, 168, 185, 255 };
-static SDL_Color C_TRACK    = { 60, 70, 84, 255 };
-static SDL_Color C_FILL     = { 56, 200, 255, 255 };
+// Palette: light translucent capsule (much lighter than the old near-opaque
+// dark bar), Ferry dark-card panel, white icon stroke, cyan progress, red X.
+static SDL_Color C_BAR_BG     = { 46, 57, 72, 168 };
+static SDL_Color C_BAR_BORDER = { 255, 255, 255, 44 };
+static SDL_Color C_HOVER      = { 255, 255, 255, 30 };
+static SDL_Color C_ACCENT     = { 37, 102, 179, 245 };
+static SDL_Color C_DANGER     = { 229, 72, 77, 255 };
+static SDL_Color C_ICON       = { 241, 246, 253, 255 };
+static SDL_Color C_MUTED      = { 149, 168, 185, 255 };
+static SDL_Color C_TRACK      = { 255, 255, 255, 36 };
+static SDL_Color C_FILL       = { 56, 200, 255, 255 };
+static SDL_Color C_PANEL_BG   = { 16, 27, 38, 242 };
+static SDL_Color C_PANEL_BORDER = { 42, 59, 75, 255 };
+static SDL_Color C_CHIP_BG    = { 255, 255, 255, 20 };
+static SDL_Color C_TOOLTIP_BG = { 20, 30, 42, 245 };
 
 FerryToolbar::FerryToolbar(Session* session)
     : m_session(session),
       m_streamWindow(nullptr),
       m_window(nullptr),
       m_windowId(0),
+      m_surface(nullptr),
       m_font(nullptr),
       m_fontSize(TOOLBAR_FONT_SIZE),
       m_surfaceW(0),
       m_surfaceH(0),
+      m_barW(0),
+      m_barH(0),
+      m_dpr(1.0f),
       m_fullscreen(false),
       m_focused(false),
       m_privacy(false),
@@ -65,6 +80,7 @@ FerryToolbar::FerryToolbar(Session* session)
       m_codec("h264"),
       m_pendingCodec("h264"),
       m_audioOnHost(true),
+      m_audioMutedLocal(false),
       m_hevcAvailable(true),
       m_hevc444Available(false),
       m_dockEdge(DockTop),
@@ -79,13 +95,18 @@ FerryToolbar::FerryToolbar(Session* session)
       m_transferDoneTick(0),
       m_showProgress(false),
       m_progressVertical(false),
+      m_tooltipVisible(false),
       m_lastTx(-1),
       m_lastTy(-1)
 {
     m_progressTrack = { 0, 0, 0, 0 };
     m_progressFill = { 0, 0, 0, 0 };
+    m_panelRect = { 0, 0, 0, 0 };
+    m_tooltipRect = { 0, 0, 0, 0 };
 #ifdef Q_OS_WIN32
     m_streamHwnd = nullptr;
+    m_hwnd = nullptr;
+    m_layered = false;
 #endif
 }
 
@@ -96,7 +117,6 @@ FerryToolbar::~FerryToolbar()
 
 static TTF_Font* loadToolbarFont(int size)
 {
-    // Prefer a CJK-capable system font so the Chinese labels render.
     const char* candidates[] = {
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/msyhbd.ttc",
@@ -118,7 +138,6 @@ static TTF_Font* loadToolbarFont(int size)
         }
     }
 
-    // Fall back to Moonlight's bundled ModeSeven font (Latin only).
     QByteArray fontData = Path::readDataFile("ModeSeven.ttf");
     if (!fontData.isEmpty()) {
         return TTF_OpenFontRW(SDL_RWFromConstMem(fontData.constData(), fontData.size()), 1, size);
@@ -126,11 +145,44 @@ static TTF_Font* loadToolbarFont(int size)
     return nullptr;
 }
 
+int FerryToolbar::S(int v) const
+{
+    return (int)qRound((double)v * (double)m_dpr);
+}
+
 bool FerryToolbar::init(SDL_Window* streamWindow)
 {
     m_streamWindow = streamWindow;
 
-    // NB: SDL_ttf is already initialized by the Session's OverlayManager.
+#ifdef Q_OS_WIN32
+    // Determine the monitor DPI of the stream window so the toolbar renders at
+    // physical resolution (crisp at 100/150/200% scaling).
+    m_dpr = 1.0f;
+    SDL_SysWMinfo streamInfo;
+    SDL_VERSION(&streamInfo.version);
+    if (SDL_GetWindowWMInfo(m_streamWindow, &streamInfo) && streamInfo.subsystem == SDL_SYSWM_WINDOWS) {
+        m_streamHwnd = streamInfo.info.win.window;
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        typedef UINT (WINAPI* GetDpiForWindowFn)(HWND);
+        GetDpiForWindowFn getDpi = (GetDpiForWindowFn)(void*)GetProcAddress(hUser32, "GetDpiForWindow");
+        UINT dpi = 96;
+        if (getDpi != nullptr) {
+            dpi = getDpi((HWND)m_streamHwnd);
+        }
+        else {
+            HDC dc = GetDC(nullptr);
+            if (dc != nullptr) {
+                dpi = GetDeviceCaps(dc, LOGPIXELSX);
+                ReleaseDC(nullptr, dc);
+            }
+        }
+        if (dpi > 0) {
+            m_dpr = (float)dpi / 96.0f;
+        }
+    }
+#endif
+
+    m_fontSize = S(TOOLBAR_FONT_SIZE);
     m_font = loadToolbarFont(m_fontSize);
     if (m_font == nullptr) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Ferry toolbar: no font available");
@@ -138,8 +190,8 @@ bool FerryToolbar::init(SDL_Window* streamWindow)
 
     m_window = SDL_CreateWindow("FerryRemoteToolbar",
                                 0, 0,
-                                TOOLBAR_CELL + TOOLBAR_MARGIN * 2,
-                                TOOLBAR_CELL + TOOLBAR_MARGIN * 2,
+                                S(TOOLBAR_CELL) + S(TOOLBAR_MARGIN) * 2,
+                                S(TOOLBAR_CELL) + S(TOOLBAR_MARGIN) * 2,
                                 SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_SKIP_TASKBAR);
     if (m_window == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Ferry toolbar window creation failed: %s", SDL_GetError());
@@ -147,30 +199,18 @@ bool FerryToolbar::init(SDL_Window* streamWindow)
     }
     m_windowId = SDL_GetWindowID(m_window);
 
-    // Ferry dark-glass style: semi-transparent, rounded corners. Opacity is a
-    // whole-window alpha; the rounded shape is applied in setShape() once the
-    // surface is sized.
-    SDL_SetWindowOpacity(m_window, 0.92f);
-
 #ifdef Q_OS_WIN32
-    // Never activate the toolbar on click so keyboard focus stays with the stream window.
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
     if (SDL_GetWindowWMInfo(m_window, &info) && info.subsystem == SDL_SYSWM_WINDOWS) {
-        LONG_PTR ex = GetWindowLongPtrW(info.info.win.window, GWL_EXSTYLE);
-        ex |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
-        SetWindowLongPtrW(info.info.win.window, GWL_EXSTYLE, ex);
-    }
-
-    // Obtain the stream window's native handle and install a message hook so
-    // the toolbar keeps following while the window is dragged. During a drag
-    // Windows runs a modal move loop, so the SDL event loop never reaches
-    // tick()/follow(); the hook reparents on WM_WINDOWPOSCHANGED/WM_MOVING.
-    m_streamHwnd = nullptr;
-    SDL_SysWMinfo streamInfo;
-    SDL_VERSION(&streamInfo.version);
-    if (SDL_GetWindowWMInfo(m_streamWindow, &streamInfo) && streamInfo.subsystem == SDL_SYSWM_WINDOWS) {
-        m_streamHwnd = streamInfo.info.win.window;
+        m_hwnd = info.info.win.window;
+        LONG_PTR ex = GetWindowLongPtrW((HWND)m_hwnd, GWL_EXSTYLE);
+        // NOACTIVATE/TOOLWINDOW keep the toolbar from stealing focus or showing
+        // in the taskbar; LAYERED makes it a per-pixel-alpha window so the
+        // rounded corners are truly transparent and anti-aliased.
+        ex |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+        SetWindowLongPtrW((HWND)m_hwnd, GWL_EXSTYLE, ex);
+        m_layered = true;
     }
     SDL_SetWindowsMessageHook(winMessageHook, this);
 #endif
@@ -187,7 +227,14 @@ void FerryToolbar::destroy()
         SDL_SetWindowsMessageHook(nullptr, nullptr);
         m_streamHwnd = nullptr;
     }
+    m_hwnd = nullptr;
+    m_layered = false;
 #endif
+    if (m_surface != nullptr) {
+        SDL_FreeSurface(m_surface);
+        m_surface = nullptr;
+    }
+    m_iconCache.clear();
     if (m_window != nullptr) {
         SDL_DestroyWindow(m_window);
         m_window = nullptr;
@@ -203,17 +250,12 @@ void FerryToolbar::destroy()
 void FerryToolbar::setFullscreen(bool fullscreen)
 {
     m_fullscreen = fullscreen;
-    // Reset the reveal timer so the bar doesn't immediately collapse after a
-    // fullscreen toggle.
     m_lastActivityTick = SDL_GetTicks();
     render();
 }
 
 void FerryToolbar::setFocused(bool focused)
 {
-    // Visibility no longer follows focus; it follows the pointer position.
-    // We still record the value so the session's existing calls remain
-    // harmless, and force a collapse when the stream window loses focus.
     m_focused = focused;
     if (!focused && !m_dragging) {
         m_expanded = false;
@@ -252,6 +294,7 @@ void FerryToolbar::setStreamOptions(const QString& codec, bool audioOnHost)
     m_codec = codec;
     m_pendingCodec = codec;
     m_audioOnHost = audioOnHost;
+    m_audioMutedLocal = false;
     render();
 }
 
@@ -268,12 +311,10 @@ void FerryToolbar::handleTransferProgress(const QJsonObject& obj)
         m_lastTransferTick = SDL_GetTicks();
     }
     else if (state == QLatin1String("done") || state == QLatin1String("failed")) {
-        // Immediately remove the progress bar and "sending" state.
         m_transferActive = false;
         m_transferPercent = 0;
         m_lastTransferTick = 0;
         if (state == QLatin1String("done")) {
-            // Flash a brief completion hint (<= 1s), then revert.
             m_transferDoneTick = SDL_GetTicks();
         }
     }
@@ -288,20 +329,22 @@ void FerryToolbar::handleFerryMessage(const QJsonObject& obj)
         handleTransferProgress(obj);
     }
     else if (type == QLatin1String("privacyState")) {
-        // Ferry confirms (or pushes) the black-screen privacy state so the
-        // toolbar button stays in sync with the actual host state.
         m_privacy = obj.value("on").toBool();
         render();
     }
     else if (type == QLatin1String("audioState")) {
         m_audioOnHost = obj.value("onHost").toBool();
+        // Sound stays on host -> speaker disabled. Sound streams here -> local
+        // mute toggle, starting unmuted. No reconnect in either case.
+        m_audioMutedLocal = false;
+        if (m_session != nullptr) {
+            m_session->setAudioMuted(false);
+        }
         render();
     }
     else if (type == QLatin1String("codecCaps")) {
         m_hevcAvailable = obj.value("hevc").toBool(true);
         m_hevc444Available = obj.value("hevc444").toBool(false);
-        // Fall back to H.264 when a previously chosen codec just became
-        // unavailable on the peer.
         auto fallback = [&](QString& codec) {
             if ((codec == QLatin1String("hevc") && !m_hevcAvailable) ||
                 (codec == QLatin1String("hevc444") && !m_hevc444Available)) {
@@ -360,16 +403,17 @@ void FerryToolbar::layout()
     TTF_Font* font = (TTF_Font*)m_font;
     m_items.clear();
     m_separators.clear();
+    m_panelLabels.clear();
     m_showProgress = false;
     m_progressVertical = !isHorizontal();
 
-    const int M = TOOLBAR_MARGIN;
-    const int C = TOOLBAR_CELL;
-    const int G = TOOLBAR_GAP;
+    const int M = S(TOOLBAR_MARGIN);
+    const int C = S(TOOLBAR_CELL);
+    const int G = S(TOOLBAR_GAP);
     const bool horiz = isHorizontal();
 
     if (!m_expanded) {
-        // Collapsed: just the drag handle.
+        // Collapsed: a single rounded handle with an expand chevron.
         Item it;
         it.id = BtnDrag;
         it.label = QString();
@@ -380,17 +424,16 @@ void FerryToolbar::layout()
         it.disabled = false;
         it.rect = { M, M, C, C };
         m_items.append(it);
-        m_surfaceW = C + 2 * M;
-        m_surfaceH = C + 2 * M;
+        m_barW = m_surfaceW = C + 2 * M;
+        m_barH = m_surfaceH = C + 2 * M;
         return;
     }
 
     int x = M;
     int y = M;
 
-    // Main button + separator sequence, matching the mockup A/B/C layout:
-    // drag / fullscreen / privacy / quality / audio | transfer (+progress) | end.
-    // BtnSeparator renders a 1px divider line and is not clickable.
+    // Main button + separator sequence: drag / fullscreen / privacy / quality /
+    // audio | transfer (+progress) | end.
     const ButtonId sequence[] = {
         BtnDrag, BtnFullscreen, BtnPrivacy, BtnQuality, BtnAudio,
         BtnSeparator, BtnTransfer, BtnSeparator, BtnEnd
@@ -400,12 +443,12 @@ void FerryToolbar::layout()
         if (sid == BtnSeparator) {
             SDL_Rect sr;
             if (horiz) {
-                sr = { x + TOOLBAR_SEP_W / 2, y + (C - 22) / 2, 1, 22 };
-                x += TOOLBAR_SEP_W + G;
+                sr = { x + S(TOOLBAR_SEP_W) / 2, y + (C - S(24)) / 2, 1, S(24) };
+                x += S(TOOLBAR_SEP_W) + G;
             }
             else {
-                sr = { x + (C - 22) / 2, y + TOOLBAR_SEP_H / 2, 22, 1 };
-                y += TOOLBAR_SEP_H + G;
+                sr = { x + (C - S(24)) / 2, y + S(TOOLBAR_SEP_H) / 2, S(24), 1 };
+                y += S(TOOLBAR_SEP_H) + G;
             }
             m_separators.append(sr);
             continue;
@@ -418,7 +461,7 @@ void FerryToolbar::layout()
         it.selected = false;
         it.hover = false;
         it.danger = (sid == BtnEnd);
-        it.disabled = false;
+        it.disabled = (sid == BtnAudio && m_audioOnHost);
         it.rect = { x, y, C, C };
         m_items.append(it);
 
@@ -427,28 +470,37 @@ void FerryToolbar::layout()
 
         // Reserve inline space for the transfer progress bar.
         if (sid == BtnTransfer && m_transferActive) {
-            if (horiz) x += TOOLBAR_PROGRESS_W + G;
-            else y += TOOLBAR_PROGRESS_H + G;
+            if (horiz) x += S(TOOLBAR_PROGRESS_W) + G;
+            else y += S(TOOLBAR_PROGRESS_H) + G;
         }
     }
 
-    // Privacy button shows a persistent active state while the black screen is on.
     if (Item* p = itemById(BtnPrivacy)) p->selected = m_privacy;
 
     int mainW = horiz ? (x - G + M) : (C + 2 * M);
     int mainH = horiz ? (C + 2 * M) : (y - G + M);
 
+    m_barW = mainW;
+    m_barH = mainH;
     m_surfaceW = mainW;
     m_surfaceH = mainH;
 
     if (m_qualityOpen) {
-        // Chip panel appended below the main bar (horizontal layout for the
-        // chips, regardless of dock orientation).
-        const int rowH = 26;
-        const int titleW = 44;
-        int px = M + 8;
-        int py = M + C + 6;
-        int cursor = py;
+        // Dark card panel below the bar with labelled chip rows. The chips use
+        // the same dark-card + solid-highlight style as the Ferry settings page.
+        const int padX = S(12);
+        const int padY = S(10);
+        const int rowH = S(28);
+        const int rowGap = S(6);
+        const int labelW = S(48);
+        const int chipGap = S(6);
+        const int chipPadH = S(12);
+
+        int panelX = 0;
+        int py = m_barH + S(6);
+        int contentX = panelX + padX;
+        int cursor = py + padY;
+        int panelW = 0;
 
         struct ChipRow { const char* title; QVector<QPair<ButtonId, const char*>> chips; };
         QVector<ChipRow> rows;
@@ -468,10 +520,11 @@ void FerryToolbar::layout()
             qMakePair(BtnCodecHevc444, "HEVC 4:4:4") } });
 
         for (const ChipRow& row : rows) {
-            int cx = px + titleW + 6;
+            int cx = contentX + labelW;
+            m_panelLabels.append(qMakePair(QString::fromUtf8(row.title), cursor + rowH / 2));
             for (const auto& chip : row.chips) {
                 QString label = QString::fromUtf8(chip.second);
-                int w = textWidth(font, label) + 12;
+                int w = textWidth(font, label) + 2 * chipPadH;
                 Item it;
                 it.id = chip.first;
                 it.label = label;
@@ -484,12 +537,15 @@ void FerryToolbar::layout()
                 else if (chip.first == BtnCodecHevc444) it.disabled = !m_hevc444Available;
                 it.rect = { cx, cursor, w, rowH };
                 m_items.append(it);
-                cx += w + G;
+                cx += w + chipGap;
             }
-            if (cx > m_surfaceW) m_surfaceW = cx + M;
-            cursor += rowH + 4;
+            if (cx - panelX + padX > panelW) panelW = cx - panelX + padX;
+            cursor += rowH + rowGap;
         }
 
+        // Apply / collapse actions.
+        const int actionPadH = S(14);
+        int ax = contentX + labelW;
         Item apply;
         apply.id = BtnApply;
         apply.label = QStringLiteral("应用并重连");
@@ -498,8 +554,7 @@ void FerryToolbar::layout()
         apply.hover = false;
         apply.danger = false;
         apply.disabled = false;
-        int ax = px + titleW + 6;
-        apply.rect = { ax, cursor, textWidth(font, apply.label) + 12, rowH };
+        apply.rect = { ax, cursor, textWidth(font, apply.label) + 2 * actionPadH, rowH };
         m_items.append(apply);
 
         Item cancel;
@@ -510,13 +565,19 @@ void FerryToolbar::layout()
         cancel.hover = false;
         cancel.danger = false;
         cancel.disabled = false;
-        cancel.rect = { apply.rect.x + apply.rect.w + G, cursor, textWidth(font, cancel.label) + 12, rowH };
+        cancel.rect = { apply.rect.x + apply.rect.w + chipGap, cursor,
+                        textWidth(font, cancel.label) + 2 * actionPadH, rowH };
         m_items.append(cancel);
 
-        int endX = cancel.rect.x + cancel.rect.w + M;
-        int endY = cancel.rect.y + cancel.rect.h + M;
-        if (endX > m_surfaceW) m_surfaceW = endX;
-        if (endY > m_surfaceH) m_surfaceH = endY;
+        int endX = cancel.rect.x + cancel.rect.w + padX;
+        int endY = cancel.rect.y + cancel.rect.h + padY;
+        if (endX > panelW) panelW = endX;
+        if (panelW < m_surfaceW) panelW = m_surfaceW;
+
+        int panelH = endY - py;
+        m_panelRect = { panelX, py, panelW, panelH };
+        m_surfaceW = panelW;
+        m_surfaceH = py + panelH;
     }
 
     auto sel = [&](ButtonId id) {
@@ -546,145 +607,177 @@ void FerryToolbar::layout()
     }
 }
 
-void FerryToolbar::putPixel(SDL_Surface* dst, int x, int y, SDL_Color c)
+// ---------------------------------------------------------------------------
+// Per-pixel alpha rasterization (straight-alpha source-over onto ARGB8888).
+
+void FerryToolbar::blendPixel(SDL_Surface* dst, int x, int y, Uint8 r, Uint8 g, Uint8 b, Uint8 a)
 {
-    if (dst == nullptr || x < 0 || y < 0 || x >= dst->w || y >= dst->h) {
+    if (dst == nullptr || x < 0 || y < 0 || x >= dst->w || y >= dst->h || a == 0) {
         return;
     }
-    SDL_Rect r = { x, y, 1, 1 };
-    SDL_FillRect(dst, &r, SDL_MapRGBA(dst->format, c.r, c.g, c.b, c.a));
-}
-
-void FerryToolbar::drawLine(SDL_Surface* dst, int x0, int y0, int x1, int y1, SDL_Color c)
-{
-    int dx = qAbs(x1 - x0);
-    int sx = x0 < x1 ? 1 : -1;
-    int dy = -qAbs(y1 - y0);
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    for (;;) {
-        putPixel(dst, x0, y0, c);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
+    Uint32* px = (Uint32*)((Uint8*)dst->pixels + y * dst->pitch) + x;
+    Uint32 cur = *px;
+    Uint8 da = (cur >> 24) & 0xFF;
+    Uint8 dr = (cur >> 16) & 0xFF;
+    Uint8 dg = (cur >> 8) & 0xFF;
+    Uint8 db = cur & 0xFF;
+    if (a == 255 || da == 0) {
+        *px = ((Uint32)a << 24) | ((Uint32)r << 16) | ((Uint32)g << 8) | (Uint32)b;
+        return;
     }
+    int sa = a;
+    int outA = sa + da * (255 - sa) / 255;
+    if (outA == 0) {
+        *px = 0;
+        return;
+    }
+    int outR = (r * sa + dr * da * (255 - sa) / 255) / outA;
+    int outG = (g * sa + dg * da * (255 - sa) / 255) / outA;
+    int outB = (b * sa + db * da * (255 - sa) / 255) / outA;
+    *px = ((Uint32)outA << 24) | ((Uint32)outR << 16) | ((Uint32)outG << 8) | (Uint32)outB;
 }
 
-void FerryToolbar::fillCircle(SDL_Surface* dst, int cx, int cy, int r, SDL_Color c)
+// Signed distance to a rounded rectangle, used for anti-aliased fills/strokes.
+static float sdRoundRect(float px, float py, float hw, float hh, float rr)
 {
-    for (int y = -r; y <= r; y++) {
-        for (int x = -r; x <= r; x++) {
-            if (x * x + y * y <= r * r) {
-                putPixel(dst, cx + x, cy + y, c);
+    float qx = fabsf(px) - hw;
+    float qy = fabsf(py) - hh;
+    float ox = qx > 0 ? qx : 0;
+    float oy = qy > 0 ? qy : 0;
+    float outside = sqrtf(ox * ox + oy * oy);
+    float inside = qMin(qMax(qx, qy), 0.0f);
+    return outside + inside - rr;
+}
+
+void FerryToolbar::fillRoundedRectAA(SDL_Surface* dst, int x0, int y0, int x1, int y1,
+                                     int radius, Uint8 r, Uint8 g, Uint8 b, Uint8 a)
+{
+    if (dst == nullptr) return;
+    if (x1 <= x0 || y1 <= y0) return;
+    int w = x1 - x0;
+    int h = y1 - y0;
+    int rr = qMin(radius, qMin(w, h) / 2);
+    float cx = (x0 + x1) * 0.5f;
+    float cy = (y0 + y1) * 0.5f;
+    float hw = w * 0.5f - rr;
+    float hh = h * 0.5f - rr;
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            float dist = sdRoundRect(x - cx + 0.5f, y - cy + 0.5f, hw, hh, (float)rr);
+            float cov = 0.5f - dist;
+            if (cov <= 0) continue;
+            if (cov >= 1) {
+                blendPixel(dst, x, y, r, g, b, a);
+            }
+            else {
+                blendPixel(dst, x, y, r, g, b, (Uint8)(a * cov));
             }
         }
     }
 }
 
-void FerryToolbar::fillRoundedRect(SDL_Surface* dst, const SDL_Rect& r, int radius, SDL_Color c)
+void FerryToolbar::strokeRoundedRectAA(SDL_Surface* dst, int x0, int y0, int x1, int y1,
+                                       int radius, float thickness,
+                                       Uint8 r, Uint8 g, Uint8 b, Uint8 a)
 {
-    int rr = qMin(radius, qMin(r.w, r.h) / 2);
-    if (rr <= 0) {
-        SDL_FillRect(dst, &r, SDL_MapRGBA(dst->format, c.r, c.g, c.b, c.a));
-        return;
-    }
-    for (int y = 0; y < r.h; y++) {
-        for (int x = 0; x < r.w; x++) {
-            int dx = 0, dy = 0;
-            if (x < rr) dx = rr - x;
-            else if (x >= r.w - rr) dx = x - (r.w - rr - 1);
-            if (y < rr) dy = rr - y;
-            else if (y >= r.h - rr) dy = y - (r.h - rr - 1);
-            if (dx * dx + dy * dy <= rr * rr) {
-                putPixel(dst, r.x + x, r.y + y, c);
+    if (dst == nullptr) return;
+    int w = x1 - x0;
+    int h = y1 - y0;
+    int rr = qMin(radius, qMin(w, h) / 2);
+    float cx = (x0 + x1) * 0.5f;
+    float cy = (y0 + y1) * 0.5f;
+    float hw = w * 0.5f - rr;
+    float hh = h * 0.5f - rr;
+    float half = thickness * 0.5f;
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            float dist = sdRoundRect(x - cx + 0.5f, y - cy + 0.5f, hw, hh, (float)rr);
+            float d = fabsf(dist);
+            float cov = 0.5f + half - d;
+            if (cov <= 0) continue;
+            if (cov >= 1) {
+                blendPixel(dst, x, y, r, g, b, a);
+            }
+            else {
+                blendPixel(dst, x, y, r, g, b, (Uint8)(a * cov));
             }
         }
     }
 }
 
-void FerryToolbar::drawIcon(SDL_Surface* dst, ButtonId id, const SDL_Rect& r, SDL_Color c)
+void FerryToolbar::blitImage(SDL_Surface* dst, const QImage& img, int dx, int dy)
 {
-    int cx = r.x + r.w / 2;
-    int cy = r.y + r.h / 2;
-    const int s = 8; // half-size of the icon
+    if (dst == nullptr || img.isNull()) return;
+    for (int y = 0; y < img.height(); y++) {
+        const uchar* row = img.constScanLine(y);
+        for (int x = 0; x < img.width(); x++) {
+            Uint8 a = row[x * 4 + 3];
+            if (a == 0) continue;
+            blendPixel(dst, dx + x, dy + y, row[x * 4 + 0], row[x * 4 + 1], row[x * 4 + 2], a);
+        }
+    }
+}
+
+QImage FerryToolbar::loadIcon(const QString& name)
+{
+    QImage img(QStringLiteral(":/res/toolbar/") + name);
+    if (img.isNull()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Ferry toolbar: missing icon %s", qPrintable(name));
+        return QImage();
+    }
+    return img.convertToFormat(QImage::Format_RGBA8888);
+}
+
+const QImage& FerryToolbar::iconAsset(const QString& name)
+{
+    QImage& img = m_iconCache[name];
+    if (img.isNull()) {
+        img = loadIcon(name);
+    }
+    return img;
+}
+
+void FerryToolbar::blitIcon(SDL_Surface* dst, ButtonId id, const SDL_Rect& r)
+{
+    QString name;
+    bool mirror = false;
 
     switch (id) {
     case BtnDrag:
-        // 6-dot grip: 3 columns x 2 rows.
-        for (int col = 0; col < 3; col++) {
-            for (int row = 0; row < 2; row++) {
-                fillCircle(dst, cx - 6 + col * 6, cy - 3 + row * 6, 1, c);
-            }
+        if (!m_expanded) {
+            name = isHorizontal() ? "toolbar_collapse.png" : "toolbar_dock_collapse.png";
         }
-        break;
-
-    case BtnFullscreen:
-        // Four corner brackets (outward-facing).
-        drawLine(dst, cx - s, cy - s + 3, cx - s, cy - s, c);
-        drawLine(dst, cx - s, cy - s, cx - s + 3, cy - s, c);
-        drawLine(dst, cx + s - 3, cy - s, cx + s, cy - s, c);
-        drawLine(dst, cx + s, cy - s, cx + s, cy - s + 3, c);
-        drawLine(dst, cx - s, cy + s - 3, cx - s, cy + s, c);
-        drawLine(dst, cx - s, cy + s, cx - s + 3, cy + s, c);
-        drawLine(dst, cx + s - 3, cy + s, cx + s, cy + s, c);
-        drawLine(dst, cx + s, cy + s, cx + s, cy + s - 3, c);
-        break;
-
-    case BtnPrivacy:
-        // Eye outline (lens shape) with a diagonal slash through it.
-        drawLine(dst, cx - s, cy, cx, cy - s, c);
-        drawLine(dst, cx, cy - s, cx + s, cy, c);
-        drawLine(dst, cx + s, cy, cx, cy + s, c);
-        drawLine(dst, cx, cy + s, cx - s, cy, c);
-        drawLine(dst, cx - s, cy + s, cx + s, cy - s, c);
-        break;
-
-    case BtnTransfer:
-        // Up arrow above a base tray.
-        drawLine(dst, cx, cy - s, cx, cy + 2, c);
-        drawLine(dst, cx - 4, cy - 4, cx, cy - s, c);
-        drawLine(dst, cx, cy - s, cx + 4, cy - 4, c);
-        drawLine(dst, cx - 6, cy + s, cx + 6, cy + s, c);
-        break;
-
-    case BtnEnd:
-        // Cross.
-        drawLine(dst, cx - s, cy - s, cx + s, cy + s, c);
-        drawLine(dst, cx + s, cy - s, cx - s, cy + s, c);
-        break;
-
-    case BtnAudio: {
-        // Speaker: right-facing box + left-pointing cone.
-        drawLine(dst, cx - 1, cy - 4, cx - 1, cy + 4, c); // front face
-        drawLine(dst, cx - 1, cy - 4, cx - 5, cy - 4, c); // top
-        drawLine(dst, cx - 1, cy + 4, cx - 5, cy + 4, c); // bottom
-        drawLine(dst, cx - 5, cy - 4, cx - 8, cy - 7, c); // cone top
-        drawLine(dst, cx - 8, cy - 7, cx - 8, cy + 7, c); // cone back
-        drawLine(dst, cx - 5, cy + 4, cx - 8, cy + 7, c); // cone bottom
-        if (!m_audioOnHost) {
-            // Sound plays on this machine: two sound-wave arcs to the right.
-            for (int rr = 3; rr <= 5; rr += 2) {
-                for (int yy = -rr; yy <= rr; yy++) {
-                    for (int xx = 0; xx <= rr; xx++) {
-                        int d2 = xx * xx + yy * yy;
-                        if (d2 <= rr * rr && d2 >= (rr - 1) * (rr - 1)) {
-                            putPixel(dst, cx + 1 + xx, cy + yy, c);
-                        }
-                    }
-                }
-            }
+        else if (!isHorizontal()) {
+            name = "toolbar_dock_collapse.png";
         }
         else {
-            // Sound stays on the host: slash through the speaker.
-            drawLine(dst, cx - 6, cy + 7, cx + 1, cy - 7, c);
+            name = "toolbar_drag.png";
         }
+        // When docked left, the collapse chevrons should point right.
+        if (!isHorizontal() && m_dockEdge == DockLeft) mirror = true;
         break;
+    case BtnFullscreen: name = "toolbar_fullscreen.png"; break;
+    case BtnPrivacy: name = m_privacy ? "toolbar_privacy_on.png" : "toolbar_privacy.png"; break;
+    case BtnQuality: name = "toolbar_hd.png"; break;
+    case BtnAudio:
+        name = m_audioOnHost ? "toolbar_audio_disabled.png"
+                             : (m_audioMutedLocal ? "toolbar_audio_muted.png" : "toolbar_audio.png");
+        break;
+    case BtnTransfer: name = "toolbar_transfer.png"; break;
+    case BtnEnd: name = "toolbar_close.png"; break;
+    default: return;
     }
 
-    default:
-        break;
-    }
+    const QImage& asset = iconAsset(name);
+    if (asset.isNull()) return;
+
+    int target = S(TOOLBAR_ICON);
+    QImage scaled = asset.scaled(target, target, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    if (mirror) scaled = scaled.mirrored(true, false);
+
+    int dx = r.x + (r.w - scaled.width()) / 2;
+    int dy = r.y + (r.h - scaled.height()) / 2;
+    blitImage(dst, scaled, dx, dy);
 }
 
 void FerryToolbar::blitText(SDL_Surface* dst, const QString& text, SDL_Color color, int x, int y)
@@ -703,13 +796,14 @@ void FerryToolbar::blitText(SDL_Surface* dst, const QString& text, SDL_Color col
     SDL_FreeSurface(s);
 }
 
+// ---------------------------------------------------------------------------
+
 void FerryToolbar::render()
 {
     if (m_window == nullptr) {
         return;
     }
 
-    // Preserve hover state across the re-layout below.
     QHash<int, bool> hoverById;
     for (const Item& item : m_items) {
         if (item.hover) {
@@ -725,64 +819,132 @@ void FerryToolbar::render()
         }
     }
 
+    // Tooltip for the disabled (on-host) audio button.
+    m_tooltipVisible = false;
+    if (Item* a = itemById(BtnAudio)) {
+        if (a->hover && a->disabled) {
+            m_tooltipVisible = true;
+            m_tooltipText = QStringLiteral("声音留在对方电脑，在高性能远控面板里改");
+            int tw = textWidth((TTF_Font*)m_font, m_tooltipText);
+            int padX = S(8);
+            int padY = S(6);
+            int w = tw + padX * 2;
+            int h = m_fontSize + padY * 2;
+            int tx = a->rect.x + (a->rect.w - w) / 2;
+            if (tx < 0) tx = 0;
+            if (tx + w > m_surfaceW) tx = m_surfaceW - w;
+            int ty = m_barH + S(6);
+            m_tooltipRect = { tx, ty, w, h };
+            if (m_surfaceH < ty + h) m_surfaceH = ty + h;
+        }
+    }
+
     SDL_SetWindowSize(m_window, m_surfaceW, m_surfaceH);
-    SDL_Surface* surface = SDL_GetWindowSurface(m_window);
-    if (surface == nullptr) {
+
+    if (m_surface == nullptr || m_surface->w != m_surfaceW || m_surface->h != m_surfaceH) {
+        if (m_surface != nullptr) {
+            SDL_FreeSurface(m_surface);
+        }
+        m_surface = SDL_CreateRGBSurfaceWithFormat(0, m_surfaceW, m_surfaceH, 32, SDL_PIXELFORMAT_ARGB8888);
+    }
+    if (m_surface == nullptr) {
         return;
     }
 
-    SDL_FillRect(surface, nullptr, SDL_MapRGBA(surface->format, C_BAR_BG.r, C_BAR_BG.g, C_BAR_BG.b, C_BAR_BG.a));
+    // Clear to fully transparent.
+    SDL_FillRect(m_surface, nullptr, SDL_MapRGBA(m_surface->format, 0, 0, 0, 0));
 
-    // Buttons (icons + hover highlight + quality "HD" text).
+    // Capsule background + subtle border (anti-aliased, translucent).
+    const int capsuleRadius = m_expanded ? qMin(m_barW, m_barH) / 2 : S(TOOLBAR_COLLAPSED_RADIUS);
+    fillRoundedRectAA(m_surface, 0, 0, m_barW, m_barH, capsuleRadius,
+                      C_BAR_BG.r, C_BAR_BG.g, C_BAR_BG.b, C_BAR_BG.a);
+    strokeRoundedRectAA(m_surface, 0, 0, m_barW, m_barH, capsuleRadius, 1.0f,
+                        C_BAR_BORDER.r, C_BAR_BORDER.g, C_BAR_BORDER.b, C_BAR_BORDER.a);
+
+    // Quality panel card.
+    if (m_qualityOpen && m_panelRect.w > 0 && m_panelRect.h > 0) {
+        fillRoundedRectAA(m_surface, m_panelRect.x, m_panelRect.y,
+                          m_panelRect.x + m_panelRect.w, m_panelRect.y + m_panelRect.h,
+                          S(12), C_PANEL_BG.r, C_PANEL_BG.g, C_PANEL_BG.b, C_PANEL_BG.a);
+        strokeRoundedRectAA(m_surface, m_panelRect.x, m_panelRect.y,
+                            m_panelRect.x + m_panelRect.w, m_panelRect.y + m_panelRect.h,
+                            S(12), 1.0f,
+                            C_PANEL_BORDER.r, C_PANEL_BORDER.g, C_PANEL_BORDER.b, C_PANEL_BORDER.a);
+        for (const auto& label : m_panelLabels) {
+            blitText(m_surface, label.first, C_MUTED, m_panelRect.x + S(12), label.second - m_fontSize / 2);
+        }
+    }
+
+    // Divider lines.
+    for (const SDL_Rect& sr : m_separators) {
+        SDL_FillRect(m_surface, &sr, SDL_MapRGBA(m_surface->format, C_MUTED.r, C_MUTED.g, C_MUTED.b, 90));
+    }
+
+    // Buttons: highlight + icon (main bar) or chip (panel).
     for (const Item& item : m_items) {
         if (!item.visible) {
             continue;
         }
 
-        // Subtle rounded highlight on hover (or selected chip). Disabled chips
-        // get no highlight so they read as unavailable.
-        if ((item.hover || item.selected) && !item.disabled) {
-            SDL_Color bg = item.danger ? C_DANGER : (item.selected ? C_ACCENT : C_HOVER);
-            SDL_Rect hi = { item.rect.x + 1, item.rect.y + 1, item.rect.w - 2, item.rect.h - 2 };
-            fillRoundedRect(surface, hi, 6, bg);
-        }
+        const bool isChip = (item.id == BtnResRemote || item.id == BtnResLocal ||
+                             item.id == BtnRes720 || item.id == BtnRes1080 ||
+                             item.id == BtnRes1440 || item.id == BtnRes4K ||
+                             item.id == BtnFps30 || item.id == BtnFps60 || item.id == BtnFps120 ||
+                             item.id == BtnRateAuto || item.id == BtnRate10 ||
+                             item.id == BtnRate20 || item.id == BtnRate40 || item.id == BtnRate80 ||
+                             item.id == BtnCodecH264 || item.id == BtnCodecHevc || item.id == BtnCodecHevc444 ||
+                             item.id == BtnApply || item.id == BtnCancel);
 
-        if (item.id == BtnQuality) {
+        if (isChip) {
+            // Panel chip: solid highlight block when selected.
+            SDL_Color textColor = C_ICON;
+            if (item.disabled) {
+                textColor = C_MUTED;
+            }
+            else if (item.selected) {
+                fillRoundedRectAA(m_surface, item.rect.x, item.rect.y,
+                                  item.rect.x + item.rect.w, item.rect.y + item.rect.h,
+                                  S(8), C_ACCENT.r, C_ACCENT.g, C_ACCENT.b, C_ACCENT.a);
+                textColor = C_ICON;
+            }
+            else if (item.hover) {
+                fillRoundedRectAA(m_surface, item.rect.x, item.rect.y,
+                                  item.rect.x + item.rect.w, item.rect.y + item.rect.h,
+                                  S(8), C_HOVER.r, C_HOVER.g, C_HOVER.b, C_HOVER.a);
+            }
+            else if (item.id == BtnApply) {
+                fillRoundedRectAA(m_surface, item.rect.x, item.rect.y,
+                                  item.rect.x + item.rect.w, item.rect.y + item.rect.h,
+                                  S(8), C_ACCENT.r, C_ACCENT.g, C_ACCENT.b, C_ACCENT.a);
+            }
+            else {
+                fillRoundedRectAA(m_surface, item.rect.x, item.rect.y,
+                                  item.rect.x + item.rect.w, item.rect.y + item.rect.h,
+                                  S(8), C_CHIP_BG.r, C_CHIP_BG.g, C_CHIP_BG.b, C_CHIP_BG.a);
+            }
+
             int tw = textWidth((TTF_Font*)m_font, item.label);
             int tx = item.rect.x + (item.rect.w - tw) / 2;
             int ty = item.rect.y + (item.rect.h - m_fontSize - 2) / 2;
-            blitText(surface, item.label, C_ICON, tx, ty);
-        }
-        else if (item.id != BtnResRemote && item.id != BtnResLocal &&
-                 item.id != BtnRes720 && item.id != BtnRes1080 &&
-                 item.id != BtnRes1440 && item.id != BtnRes4K &&
-                 item.id != BtnFps30 && item.id != BtnFps60 && item.id != BtnFps120 &&
-                 item.id != BtnRateAuto && item.id != BtnRate10 && item.id != BtnRate20 &&
-                 item.id != BtnRate40 && item.id != BtnRate80 &&
-                 item.id != BtnCodecH264 && item.id != BtnCodecHevc && item.id != BtnCodecHevc444 &&
-                 item.id != BtnApply && item.id != BtnCancel) {
-            // Line icon. The close button is red; the audio button is muted
-            // gray while sound stays on the host.
-            SDL_Color iconColor = C_ICON;
-            if (item.id == BtnEnd) iconColor = C_DANGER;
-            else if (item.id == BtnAudio && m_audioOnHost) iconColor = C_MUTED;
-            drawIcon(surface, item.id, item.rect, iconColor);
+            blitText(m_surface, item.label, textColor, tx, ty);
         }
         else {
-            // Text chip (quality panel). Disabled chips render gray.
-            int tw = textWidth((TTF_Font*)m_font, item.label);
-            int tx = item.rect.x + (item.rect.w - tw) / 2;
-            int ty = item.rect.y + (item.rect.h - m_fontSize - 2) / 2;
-            blitText(surface, item.label, item.disabled ? C_MUTED : C_ICON, tx, ty);
+            // Main-bar icon button: subtle highlight on hover / persistent
+            // highlight on selected (privacy on).
+            if ((item.hover || item.selected) && !item.disabled) {
+                SDL_Color bg = item.selected ? C_ACCENT : C_HOVER;
+                int r = S(8);
+                fillRoundedRectAA(m_surface, item.rect.x + S(2), item.rect.y + S(2),
+                                  item.rect.x + item.rect.w - S(2), item.rect.y + item.rect.h - S(2),
+                                  r, bg.r, bg.g, bg.b, bg.a);
+            }
+
+            // Main-bar icon button (including the HD badge).
+            blitIcon(m_surface, item.id, item.rect);
         }
     }
 
-    // Divider lines between button groups.
-    for (const SDL_Rect& sr : m_separators) {
-        SDL_FillRect(surface, &sr, SDL_MapRGBA(surface->format, C_MUTED.r, C_MUTED.g, C_MUTED.b, C_MUTED.a));
-    }
-
-    // Transfer progress bar, adjacent to the transfer button.
+    // Transfer progress bar adjacent to the transfer button.
     m_showProgress = false;
     if (m_transferActive || (SDL_GetTicks() - m_transferDoneTick) < TOOLBAR_DONE_FLASH_MS) {
         if (Item* transfer = itemById(BtnTransfer)) {
@@ -791,18 +953,20 @@ void FerryToolbar::render()
             const bool flashDone = !m_transferActive;
 
             if (m_progressVertical) {
-                // Vertical bar below the transfer icon (only when expanded and docked left/right).
-                m_progressTrack = { transfer->rect.x + (transfer->rect.w - TOOLBAR_PROGRESS_THICK) / 2,
-                                    transfer->rect.y + transfer->rect.h + 4,
-                                    TOOLBAR_PROGRESS_THICK, TOOLBAR_PROGRESS_H };
+                m_progressTrack = { transfer->rect.x + (transfer->rect.w - S(TOOLBAR_PROGRESS_THICK)) / 2,
+                                    transfer->rect.y + transfer->rect.h + S(4),
+                                    S(TOOLBAR_PROGRESS_THICK), S(TOOLBAR_PROGRESS_H) };
             }
             else {
-                m_progressTrack = { transfer->rect.x + transfer->rect.w + 4,
-                                    transfer->rect.y + (transfer->rect.h - TOOLBAR_PROGRESS_THICK) / 2,
-                                    TOOLBAR_PROGRESS_W, TOOLBAR_PROGRESS_THICK };
+                m_progressTrack = { transfer->rect.x + transfer->rect.w + S(4),
+                                    transfer->rect.y + (transfer->rect.h - S(TOOLBAR_PROGRESS_THICK)) / 2,
+                                    S(TOOLBAR_PROGRESS_W), S(TOOLBAR_PROGRESS_THICK) };
             }
 
-            SDL_FillRect(surface, &m_progressTrack, SDL_MapRGBA(surface->format, C_TRACK.r, C_TRACK.g, C_TRACK.b, C_TRACK.a));
+            fillRoundedRectAA(m_surface, m_progressTrack.x, m_progressTrack.y,
+                              m_progressTrack.x + m_progressTrack.w, m_progressTrack.y + m_progressTrack.h,
+                              S(TOOLBAR_PROGRESS_THICK) / 2,
+                              C_TRACK.r, C_TRACK.g, C_TRACK.b, C_TRACK.a);
 
             int percent = flashDone ? 100 : m_transferPercent;
             if (m_progressVertical) {
@@ -811,81 +975,132 @@ void FerryToolbar::render()
                                   m_progressTrack.y + (m_progressTrack.h - filled),
                                   m_progressTrack.w, filled };
                 m_progressFill = fill;
-                SDL_FillRect(surface, &fill, SDL_MapRGBA(surface->format, C_FILL.r, C_FILL.g, C_FILL.b, C_FILL.a));
+                fillRoundedRectAA(m_surface, fill.x, fill.y, fill.x + fill.w, fill.y + fill.h,
+                                  S(TOOLBAR_PROGRESS_THICK) / 2,
+                                  C_FILL.r, C_FILL.g, C_FILL.b, C_FILL.a);
             }
             else {
                 int filled = m_progressTrack.w * percent / 100;
                 SDL_Rect fill = { m_progressTrack.x, m_progressTrack.y, filled, m_progressTrack.h };
                 m_progressFill = fill;
-                SDL_FillRect(surface, &fill, SDL_MapRGBA(surface->format, C_FILL.r, C_FILL.g, C_FILL.b, C_FILL.a));
+                fillRoundedRectAA(m_surface, fill.x, fill.y, fill.x + fill.w, fill.y + fill.h,
+                                  S(TOOLBAR_PROGRESS_THICK) / 2,
+                                  C_FILL.r, C_FILL.g, C_FILL.b, C_FILL.a);
             }
 
             if (!flashDone) {
                 QString pct = QString::number(m_transferPercent) + "%";
                 int tw = textWidth((TTF_Font*)m_font, pct);
                 if (m_progressVertical) {
-                    blitText(surface, pct, C_ICON, m_progressTrack.x + (m_progressTrack.w - tw) / 2,
-                             m_progressTrack.y - m_fontSize - 4);
+                    blitText(m_surface, pct, C_ICON, m_progressTrack.x + (m_progressTrack.w - tw) / 2,
+                             m_progressTrack.y - m_fontSize - S(4));
                 }
                 else {
-                    blitText(surface, pct, C_ICON, m_progressTrack.x + (m_progressTrack.w - tw) / 2,
-                             m_progressTrack.y + m_progressTrack.h + 2);
+                    blitText(m_surface, pct, C_ICON, m_progressTrack.x + (m_progressTrack.w - tw) / 2,
+                             m_progressTrack.y + m_progressTrack.h + S(2));
                 }
             }
         }
     }
 
-    // Status line (informational, e.g. "正在发送文件…" has been replaced by
-    // the progress bar, so this is only used for transient messages).
+    // Tooltip.
+    if (m_tooltipVisible && m_tooltipRect.w > 0) {
+        fillRoundedRectAA(m_surface, m_tooltipRect.x, m_tooltipRect.y,
+                          m_tooltipRect.x + m_tooltipRect.w, m_tooltipRect.y + m_tooltipRect.h,
+                          S(6), C_TOOLTIP_BG.r, C_TOOLTIP_BG.g, C_TOOLTIP_BG.b, C_TOOLTIP_BG.a);
+        strokeRoundedRectAA(m_surface, m_tooltipRect.x, m_tooltipRect.y,
+                            m_tooltipRect.x + m_tooltipRect.w, m_tooltipRect.y + m_tooltipRect.h,
+                            S(6), 1.0f, C_PANEL_BORDER.r, C_PANEL_BORDER.g, C_PANEL_BORDER.b, C_PANEL_BORDER.a);
+        blitText(m_surface, m_tooltipText, C_ICON,
+                 m_tooltipRect.x + S(8), m_tooltipRect.y + (m_tooltipRect.h - m_fontSize) / 2);
+    }
+
+    // Transient status line.
     if (!m_status.isEmpty() && (SDL_GetTicks() - m_statusTick) < TOOLBAR_STATUS_MS) {
-        int sx = TOOLBAR_MARGIN + 8;
-        int sy = TOOLBAR_MARGIN + TOOLBAR_CELL + 4;
-        blitText(surface, m_status, C_MUTED, sx, sy);
+        int sx = S(TOOLBAR_MARGIN) + S(8);
+        int sy = S(TOOLBAR_MARGIN) + S(TOOLBAR_CELL) + S(4);
+        blitText(m_surface, m_status, C_MUTED, sx, sy);
     }
     else {
         m_status.clear();
     }
 
-    SDL_UpdateWindowSurface(m_window);
+    present();
 
-    setShape();
-
-    // Re-dock immediately after a resize (e.g. the progress bar or quality
-    // panel changed the surface size) so the bar doesn't sit at a stale spot
-    // until the next tick().
     follow();
 }
-
-void FerryToolbar::setShape()
+void FerryToolbar::present()
 {
-    if (m_window == nullptr || m_surfaceW <= 0 || m_surfaceH <= 0) {
-        return;
-    }
-
-    const int radius = 10;
-    SDL_Surface* shape = SDL_CreateRGBSurfaceWithFormat(0, m_surfaceW, m_surfaceH, 32, SDL_PIXELFORMAT_ARGB8888);
-    if (shape == nullptr) {
-        return;
-    }
-    SDL_FillRect(shape, nullptr, SDL_MapRGBA(shape->format, 0, 0, 0, 0));
-
-    Uint32 opaque = SDL_MapRGBA(shape->format, 255, 255, 255, 255);
-    int r = qMin(radius, qMin(m_surfaceW, m_surfaceH) / 2);
-    for (int y = 0; y < m_surfaceH; y++) {
-        for (int x = 0; x < m_surfaceW; x++) {
-            int dx = 0, dy = 0;
-            if (x < r) dx = r - x;
-            else if (x >= m_surfaceW - r) dx = x - (m_surfaceW - r - 1);
-            if (y < r) dy = r - y;
-            else if (y >= m_surfaceH - r) dy = y - (m_surfaceH - r - 1);
-            if (dx * dx + dy * dy <= r * r) {
-                ((Uint32*)shape->pixels)[y * (shape->pitch / 4) + x] = opaque;
+#ifdef Q_OS_WIN32
+    if (m_layered && m_hwnd != nullptr && m_surface != nullptr && m_surfaceW > 0 && m_surfaceH > 0) {
+        const int w = m_surface->w;
+        const int h = m_surface->h;
+        QByteArray bits(w * h * 4, 0);
+        Uint32* src = (Uint32*)m_surface->pixels;
+        const int pitch = m_surface->pitch;
+        uchar* dst = (uchar*)bits.data();
+        for (int y = 0; y < h; y++) {
+            Uint32* row = (Uint32*)((Uint8*)src + y * pitch);
+            uchar* drow = dst + y * w * 4;
+            for (int x = 0; x < w; x++) {
+                Uint32 px = row[x];
+                Uint8 a = (px >> 24) & 0xFF;
+                Uint8 r = (px >> 16) & 0xFF;
+                Uint8 g = (px >> 8) & 0xFF;
+                Uint8 b = px & 0xFF;
+                drow[x * 4 + 0] = (b * a) / 255;
+                drow[x * 4 + 1] = (g * a) / 255;
+                drow[x * 4 + 2] = (r * a) / 255;
+                drow[x * 4 + 3] = a;
             }
         }
-    }
 
-    SDL_SetWindowShape(m_window, shape, nullptr);
-    SDL_FreeSurface(shape);
+        BITMAPINFO bi;
+        ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h; // top-down DIB
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        HDC screenDC = GetDC(nullptr);
+        HDC memDC = CreateCompatibleDC(screenDC);
+        void* pvBits = nullptr;
+        HBITMAP hbm = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
+        if (hbm != nullptr && pvBits != nullptr) {
+            memcpy(pvBits, bits.constData(), (size_t)w * h * 4);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, hbm);
+
+            int wx, wy;
+            SDL_GetWindowPosition(m_window, &wx, &wy);
+            POINT ptDst = { wx, wy };
+            SIZE size = { w, h };
+            POINT ptSrc = { 0, 0 };
+            BLENDFUNCTION blend;
+            blend.BlendOp = AC_SRC_OVER;
+            blend.BlendFlags = 0;
+            blend.SourceConstantAlpha = 255;
+            blend.AlphaFormat = AC_SRC_ALPHA;
+
+            UpdateLayeredWindow((HWND)m_hwnd, screenDC, &ptDst, &size, memDC, &ptSrc, 0, &blend, ULW_ALPHA);
+
+            SelectObject(memDC, oldBmp);
+            DeleteObject(hbm);
+        }
+        DeleteDC(memDC);
+        ReleaseDC(nullptr, screenDC);
+        return;
+    }
+#endif
+    // Fallback (non-Windows): copy the offscreen surface to the window surface.
+    if (m_window != nullptr && m_surface != nullptr) {
+        SDL_Surface* ws = SDL_GetWindowSurface(m_window);
+        if (ws != nullptr) {
+            SDL_BlitSurface(m_surface, nullptr, ws, nullptr);
+            SDL_UpdateWindowSurface(m_window);
+        }
+    }
 }
 
 void FerryToolbar::computeClientRect(int& cx, int& cy, int& cw, int& ch)
@@ -903,9 +1118,6 @@ void FerryToolbar::computeClientRect(int& cx, int& cy, int& cw, int& ch)
     SDL_GetWindowSize(m_streamWindow, &cw, &ch);
 
 #ifdef Q_OS_WIN32
-    // Keep the toolbar inside the stream window's CLIENT area (the video
-    // region). In windowed mode wx/wy include the title bar and frame, so
-    // measure the client rect directly instead of guessing the decoration size.
     if (m_streamHwnd != nullptr) {
         RECT rc;
         if (GetClientRect((HWND)m_streamHwnd, &rc)) {
@@ -929,7 +1141,7 @@ void FerryToolbar::reposition(int cx, int cy, int cw, int ch)
         return;
     }
 
-    const int margin = 2;
+    const int margin = S(2);
     int tx = cx;
     int ty = cy;
 
@@ -952,7 +1164,6 @@ void FerryToolbar::reposition(int cx, int cy, int cw, int ch)
         break;
     }
 
-    // Clamp inside the client area.
     if (tx < cx) tx = cx;
     if (ty < cy) ty = cy;
     if (tx + m_surfaceW > cx + cw) tx = cx + cw - m_surfaceW;
@@ -964,6 +1175,9 @@ void FerryToolbar::reposition(int cx, int cy, int cw, int ch)
         SDL_SetWindowPosition(m_window, tx, ty);
         m_lastTx = tx;
         m_lastTy = ty;
+        // The layered snapshot is positioned independently of the HWND, so
+        // re-present it at the new position whenever the window moves.
+        present();
     }
 }
 
@@ -992,8 +1206,6 @@ void FerryToolbar::followTo(int wx, int wy, int ww)
     }
     int cx, cy, cw, ch;
     computeClientRect(cx, cy, cw, ch);
-    // The hook gives us the outer frame rect; prefer the client rect above,
-    // but fall back to the passed values if the client rect is unavailable.
     if (cw <= 0 || ch <= 0) {
         cw = ww;
     }
@@ -1013,7 +1225,6 @@ void FerryToolbar::dockToNearestEdge()
     int tx = wx + m_surfaceW / 2;
     int ty = wy + m_surfaceH / 2;
 
-    // Distance to each edge.
     int dTop = ty - cy;
     int dBottom = (cy + ch) - ty;
     int dLeft = tx - cx;
@@ -1059,10 +1270,8 @@ void FerryToolbar::tick()
         return;
     }
 
-    // Let Ferry push transferProgress updates into the toolbar.
     FerryBridge::readMessages();
 
-    // Timeout for a stuck "sending" state.
     if (m_transferActive && (SDL_GetTicks() - m_lastTransferTick) > TOOLBAR_TRANSFER_TIMEOUT) {
         m_transferActive = false;
         m_transferPercent = 0;
@@ -1072,21 +1281,15 @@ void FerryToolbar::tick()
     int mouseX, mouseY;
     Uint32 buttons = SDL_GetGlobalMouseState(&mouseX, &mouseY);
 
-    // Toolbar window rect (global).
     int wx, wy, ww, wh;
     SDL_GetWindowPosition(m_window, &wx, &wy);
     SDL_GetWindowSize(m_window, &ww, &wh);
 
-    // Stream client rect (global).
     int cx, cy, cw, ch;
     computeClientRect(cx, cy, cw, ch);
 
     Uint32 now = SDL_GetTicks();
 
-    // Dragging: move the toolbar with the pointer. We also detect the release
-    // here from the global button state, so the drag ends cleanly even if the
-    // pointer has moved off the toolbar window (where the button-up would not
-    // be delivered).
     if (m_dragging) {
         if (!(buttons & SDL_BUTTON(SDL_BUTTON_LEFT))) {
             m_dragging = false;
@@ -1100,19 +1303,16 @@ void FerryToolbar::tick()
             SDL_SetWindowPosition(m_window, nx, ny);
             m_lastTx = nx;
             m_lastTy = ny;
+            present(); // keep the layered snapshot following the pointer
         }
         return;
     }
 
-    // Determine whether the pointer is over the toolbar (expanded rect) or,
-    // when collapsed, over the handle.
     bool overToolbar = (mouseX >= wx && mouseX < wx + ww && mouseY >= wy && mouseY < wy + wh);
 
-    // In fullscreen, also treat the middle of the docked edge as a reveal zone
-    // so the bar can be summoned even if the handle is not hit exactly.
     bool overRevealZone = false;
     if (m_fullscreen && !m_expanded) {
-        const int zone = 14;
+        const int zone = S(14);
         switch (m_dockEdge) {
         case DockTop:    overRevealZone = (mouseY <= cy + zone); break;
         case DockBottom: overRevealZone = (mouseY >= cy + ch - zone); break;
@@ -1132,7 +1332,6 @@ void FerryToolbar::tick()
         }
     }
     else {
-        // Collapse after a short delay.
         Uint32 hideMs = m_fullscreen ? TOOLBAR_FS_HIDE_MS : TOOLBAR_WIN_HIDE_MS;
         if (m_expanded && (now - m_lastActivityTick) > hideMs) {
             m_expanded = false;
@@ -1155,7 +1354,6 @@ bool FerryToolbar::handleMouseButton(const SDL_MouseButtonEvent* ev)
         if (item != nullptr && !item->disabled) {
             item->hover = true;
             if (item->id == BtnDrag) {
-                // Begin dragging the toolbar.
                 int gx, gy;
                 SDL_GetGlobalMouseState(&gx, &gy);
                 int wx, wy;
@@ -1178,7 +1376,6 @@ bool FerryToolbar::handleMouseButton(const SDL_MouseButtonEvent* ev)
         }
     }
 
-    // Clicks inside the toolbar window are always consumed.
     return true;
 }
 
@@ -1189,7 +1386,6 @@ bool FerryToolbar::handleMouseMotion(const SDL_MouseMotionEvent* ev)
     }
 
     if (m_dragging) {
-        // Reposition is handled in tick() using the global pointer position.
         return true;
     }
 
@@ -1210,7 +1406,6 @@ void FerryToolbar::onButton(ButtonId id)
 {
     switch (id) {
     case BtnDrag:
-        // Dragging is handled in handleMouseButton.
         break;
 
     case BtnFullscreen:
@@ -1236,17 +1431,19 @@ void FerryToolbar::onButton(ButtonId id)
         break;
 
     case BtnAudio:
-        // Toggle whether audio stays on the host. Changing --audio-on-host
-        // requires relaunching Moonlight, so this reconnects immediately with
-        // the current quality/codec and the new audio state.
-        m_audioOnHost = !m_audioOnHost;
+        // Disabled while the sound stays on the host (audioState onHost=true).
+        // Otherwise toggle local mute only — no reconnect.
+        if (m_audioOnHost) {
+            break;
+        }
+        m_audioMutedLocal = !m_audioMutedLocal;
+        if (m_session != nullptr) {
+            m_session->setAudioMuted(m_audioMutedLocal);
+        }
         render();
-        sendReconnectCurrent();
         break;
 
     case BtnTransfer:
-        // The transfer button itself has no action; files are dropped onto the
-        // stream window. Progress is driven by Ferry's transferProgress.
         break;
 
     case BtnEnd:
@@ -1281,7 +1478,6 @@ void FerryToolbar::onButton(ButtonId id)
     case BtnRate80: m_pendingBitrateAuto = false; m_pendingBitrateMbps = 80; render(); break;
 
     case BtnCodecH264:
-        // H.264 is always available.
         m_pendingCodec = "h264";
         render();
         break;
@@ -1324,6 +1520,5 @@ void FerryToolbar::onButton(ButtonId id)
 
 void FerryToolbar::sendReconnectCurrent()
 {
-    FerryBridge::sendReconnect(m_resKey, m_fps, m_bitrateMbps, m_bitrateAuto,
-                               m_codec, m_audioOnHost);
+    FerryBridge::sendReconnect(m_resKey, m_fps, m_bitrateMbps, m_bitrateAuto, m_codec);
 }

@@ -122,6 +122,14 @@ public:
         return m_OverlayManager;
     }
 
+    // Toggle local audio mute. Reuses the existing focus-loss mute flag (the
+    // decode/buffer paths are untouched; arDecodeAndPlaySample() simply
+    // short-circuits before decoding when muted).
+    void setAudioMuted(bool muted)
+    {
+        m_AudioMuted = muted;
+    }
+
     void flushWindowEvents();
 
     void setShouldExit(bool quitHostApp = false);

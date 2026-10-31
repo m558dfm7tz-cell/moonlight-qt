@@ -68,7 +68,7 @@ void FerryBridge::sendQuit()
 }
 
 void FerryBridge::sendReconnect(const QString& resolution, int fps, int bitrateMbps, bool bitrateAuto,
-                                const QString& codec, bool audioOnHost)
+                                const QString& codec)
 {
     QJsonObject obj;
     obj.insert("type", "reconnect");
@@ -77,7 +77,6 @@ void FerryBridge::sendReconnect(const QString& resolution, int fps, int bitrateM
     obj.insert("bitrateMbps", bitrateMbps);
     obj.insert("bitrateAuto", bitrateAuto);
     obj.insert("codec", codec);
-    obj.insert("audioOnHost", audioOnHost);
     send(obj);
 }
 

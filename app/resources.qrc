@@ -18,6 +18,18 @@
         <file>res/baseline-error_outline-24px.svg</file>
         <file>res/baseline-check_circle_outline-24px.svg</file>
         <file>res/discord.svg</file>
+        <file>res/toolbar/toolbar_drag.png</file>
+        <file>res/toolbar/toolbar_fullscreen.png</file>
+        <file>res/toolbar/toolbar_privacy.png</file>
+        <file>res/toolbar/toolbar_privacy_on.png</file>
+        <file>res/toolbar/toolbar_hd.png</file>
+        <file>res/toolbar/toolbar_audio.png</file>
+        <file>res/toolbar/toolbar_audio_muted.png</file>
+        <file>res/toolbar/toolbar_audio_disabled.png</file>
+        <file>res/toolbar/toolbar_transfer.png</file>
+        <file>res/toolbar/toolbar_close.png</file>
+        <file>res/toolbar/toolbar_collapse.png</file>
+        <file>res/toolbar/toolbar_dock_collapse.png</file>
         <file>languages/qml_de.ts</file>
         <file>languages/qml_de.qm</file>
         <file>languages/qml_fr.ts</file>

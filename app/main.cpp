@@ -1074,8 +1074,13 @@ int main(int argc, char *argv[])
         engine.rootContext()->setContextProperty("initialView", initialView);
         engine.rootContext()->setContextProperty("isGuiLaunch", commandLineParserResult == GlobalCommandLineParser::NormalStartRequested);
 
-        // Load the main.qml file
-        engine.load(QUrl(QStringLiteral("qrc:/gui/main.qml")));
+        // Ferry / CLI stream launches use a minimal QML host (CliStream.qml)
+        // that skips the PC list, app grid, settings page and their icons and
+        // dialogs, since none of them are needed while streaming. The normal
+        // GUI launch still loads the full main.qml.
+        bool streamOnly = (commandLineParserResult == GlobalCommandLineParser::StreamRequested);
+        engine.load(QUrl(streamOnly ? QStringLiteral("qrc:/gui/CliStream.qml")
+                                    : QStringLiteral("qrc:/gui/main.qml")));
         if (engine.rootObjects().isEmpty())
             return -1;
     }
