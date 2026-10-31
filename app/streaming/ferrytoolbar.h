@@ -34,6 +34,12 @@ public:
     // Reposition the toolbar over the top-centre of the stream window.
     void follow();
 
+    // Reposition the toolbar from an explicit stream-window rectangle. Used by
+    // the Windows message hook while the window is being dragged, when the SDL
+    // event loop is blocked inside the modal move loop and follow() is never
+    // reached.
+    void followTo(int wx, int wy, int ww);
+
     // Update focus state and recompute visibility (auto-hide in fullscreen).
     void setFocused(bool focused);
     void tick();
@@ -99,6 +105,16 @@ private:
     SDL_Window* m_streamWindow;
     SDL_Window* m_window;
     Uint32 m_windowId;
+
+#ifdef Q_OS_WIN32
+    // Windows message hook so the toolbar keeps following the stream window
+    // while the user drags it. During a title-bar drag Windows enters a modal
+    // move loop and the SDL event loop is blocked, so WM_WINDOWPOSCHANGED /
+    // WM_MOVING must be handled from inside the message hook.
+    static void SDLCALL winMessageHook(void* userdata, void* hWnd,
+                                       unsigned int message, Uint64 wParam, Sint64 lParam);
+    void* m_streamHwnd;
+#endif
 
     void* m_font; // TTF_Font*
     int m_fontSize;

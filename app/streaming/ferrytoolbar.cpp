@@ -59,6 +59,9 @@ FerryToolbar::FerryToolbar(Session* session)
       m_visible(false),
       m_lastTopTick(0)
 {
+#ifdef Q_OS_WIN32
+    m_streamHwnd = nullptr;
+#endif
 }
 
 FerryToolbar::~FerryToolbar()
@@ -127,6 +130,18 @@ bool FerryToolbar::init(SDL_Window* streamWindow)
         ex |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
         SetWindowLongPtrW(info.info.win.window, GWL_EXSTYLE, ex);
     }
+
+    // Obtain the stream window's native handle and install a message hook so
+    // the toolbar keeps following while the window is dragged. During a drag
+    // Windows runs a modal move loop, so the SDL event loop never reaches
+    // tick()/follow(); the hook reparents on WM_WINDOWPOSCHANGED/WM_MOVING.
+    m_streamHwnd = nullptr;
+    SDL_SysWMinfo streamInfo;
+    SDL_VERSION(&streamInfo.version);
+    if (SDL_GetWindowWMInfo(m_streamWindow, &streamInfo) && streamInfo.subsystem == SDL_SYSWM_WINDOWS) {
+        m_streamHwnd = streamInfo.info.win.window;
+    }
+    SDL_SetWindowsMessageHook(winMessageHook, this);
 #endif
 
     return true;
@@ -134,6 +149,12 @@ bool FerryToolbar::init(SDL_Window* streamWindow)
 
 void FerryToolbar::destroy()
 {
+#ifdef Q_OS_WIN32
+    if (m_streamHwnd != nullptr) {
+        SDL_SetWindowsMessageHook(nullptr, nullptr);
+        m_streamHwnd = nullptr;
+    }
+#endif
     if (m_window != nullptr) {
         SDL_DestroyWindow(m_window);
         m_window = nullptr;
@@ -497,11 +518,46 @@ void FerryToolbar::follow()
     int wx, wy, ww, wh;
     SDL_GetWindowPosition(m_streamWindow, &wx, &wy);
     SDL_GetWindowSize(m_streamWindow, &ww, &wh);
+    followTo(wx, wy, ww);
+}
+
+void FerryToolbar::followTo(int wx, int wy, int ww)
+{
+    if (m_window == nullptr || m_streamWindow == nullptr) {
+        return;
+    }
+    if (!m_visible) {
+        return;
+    }
     int tx = wx + (ww - m_surfaceW) / 2;
     if (tx < wx) tx = wx;
     int ty = wy + 2;
     SDL_SetWindowPosition(m_window, tx, ty);
 }
+
+#ifdef Q_OS_WIN32
+void SDLCALL FerryToolbar::winMessageHook(void* userdata, void* hWnd,
+                                          unsigned int message, Uint64 wParam, Sint64 lParam)
+{
+    (void)wParam;
+    FerryToolbar* self = static_cast<FerryToolbar*>(userdata);
+    if (self == nullptr || hWnd == nullptr || self->m_streamHwnd == nullptr) {
+        return;
+    }
+    if (hWnd != self->m_streamHwnd) {
+        return;
+    }
+
+    if (message == WM_WINDOWPOSCHANGED) {
+        const WINDOWPOS* wp = reinterpret_cast<const WINDOWPOS*>(static_cast<LPARAM>(lParam));
+        self->followTo(wp->x, wp->y, wp->cx);
+    }
+    else if (message == WM_MOVING) {
+        const RECT* r = reinterpret_cast<const RECT*>(static_cast<LPARAM>(lParam));
+        self->followTo(r->left, r->top, r->right - r->left);
+    }
+}
+#endif
 
 void FerryToolbar::tick()
 {
