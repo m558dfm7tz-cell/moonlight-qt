@@ -1969,6 +1969,17 @@ void Session::exec()
             else if (m_Preferences->width == 3840 && m_Preferences->height == 2160) resKey = "4K";
             int bitrateMbps = qMax(1, m_Preferences->bitrateKbps / 1000);
             m_Toolbar->setQuality(resKey, m_Preferences->fps, bitrateMbps, false);
+            // Reflect the launch-time codec and audio-on-host so the toolbar
+            // shows the true state after the initial launch and after a
+            // quality/codec/audio reconnect (see wb_AH_ipc_spec.md).
+            QString codec = "h264";
+            if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_HEVC) {
+                codec = m_Preferences->enableYUV444 ? "hevc444" : "hevc";
+            }
+            else if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_H264) {
+                codec = "h264";
+            }
+            m_Toolbar->setStreamOptions(codec, m_Preferences->playAudioOnHost);
             m_Toolbar->setFullscreen(m_IsFullScreen);
             m_Toolbar->setFocused(true);
         }
@@ -1977,11 +1988,12 @@ void Session::exec()
             m_Toolbar = nullptr;
         }
         FerryBridge::sendHello();
-        // Route Ferry -> Moonlight messages (transferProgress) to the toolbar.
-        // readMessages() is pumped from FerryToolbar::tick() during the SDL loop.
+        // Route Ferry -> Moonlight messages (transferProgress, privacyState,
+        // audioState, codecCaps) to the toolbar. readMessages() is pumped from
+        // FerryToolbar::tick() during the SDL loop.
         FerryBridge::setMessageHandler([this](const QJsonObject& obj) {
             if (m_Toolbar != nullptr) {
-                m_Toolbar->handleTransferProgress(obj);
+                m_Toolbar->handleFerryMessage(obj);
             }
         });
     }

@@ -69,9 +69,15 @@ public:
     void setFullscreen(bool fullscreen);
     void setPrivacy(bool on);
     void setQuality(const QString& resKey, int fps, int bitrateMbps, bool bitrateAuto);
+    // Set the codec ("h264" | "hevc" | "hevc444") and audio-on-host state from
+    // the launch preferences, at stream start and after a reconnect.
+    void setStreamOptions(const QString& codec, bool audioOnHost);
     void setStatus(const QString& text);
 
-    // Ferry -> Moonlight transferProgress message (see wb_AG_ipc_spec.md).
+    // Ferry -> Moonlight messages. Dispatches transferProgress (see
+    // wb_AG_ipc_spec.md) plus the new privacyState / audioState / codecCaps
+    // messages (see wb_AH_ipc_spec.md).
+    void handleFerryMessage(const QJsonObject& obj);
     void handleTransferProgress(const QJsonObject& obj);
 
 private:
@@ -80,6 +86,8 @@ private:
         BtnFullscreen,
         BtnPrivacy,
         BtnQuality,
+        BtnAudio,
+        BtnSeparator,
         BtnTransfer,
         BtnEnd,
         BtnResRemote,
@@ -96,6 +104,9 @@ private:
         BtnRate20,
         BtnRate40,
         BtnRate80,
+        BtnCodecH264,
+        BtnCodecHevc,
+        BtnCodecHevc444,
         BtnApply,
         BtnCancel,
         BtnCount
@@ -110,6 +121,7 @@ private:
         bool selected;
         bool hover;
         bool danger;
+        bool disabled;
     };
 
     void layout();
@@ -122,12 +134,13 @@ private:
     static void drawLine(struct SDL_Surface* dst, int x0, int y0, int x1, int y1, SDL_Color c);
     static void fillCircle(struct SDL_Surface* dst, int cx, int cy, int r, SDL_Color c);
     static void fillRoundedRect(struct SDL_Surface* dst, const SDL_Rect& r, int radius, SDL_Color c);
-    static void drawIcon(struct SDL_Surface* dst, ButtonId id, const SDL_Rect& r, SDL_Color c);
+    void drawIcon(struct SDL_Surface* dst, ButtonId id, const SDL_Rect& r, SDL_Color c);
 
     Item* itemAt(int x, int y);
     Item* itemById(ButtonId id);
     void onButton(ButtonId id);
     QString qualityLabel() const;
+    void sendReconnectCurrent();
 
     // Position/size helpers.
     void computeClientRect(int& cx, int& cy, int& cw, int& ch);
@@ -173,6 +186,21 @@ private:
     int m_pendingFps;
     int m_pendingBitrateMbps;
     bool m_pendingBitrateAuto;
+
+    // Current codec ("h264" | "hevc" | "hevc444") and pending panel value.
+    // Audio: true = sound stays on the remote host (default), false = sound
+    // plays on this machine. See wb_AH_ipc_spec.md.
+    QString m_codec;
+    QString m_pendingCodec;
+    bool m_audioOnHost;
+
+    // Codec availability reported by Ferry (codecCaps). H.264 is always
+    // available; HEVC 4:4:4 defaults to unavailable until confirmed.
+    bool m_hevcAvailable;
+    bool m_hevc444Available;
+
+    // Vertical/horizontal divider line rects between button groups.
+    QVector<SDL_Rect> m_separators;
 
     // Dock / expand state.
     DockEdge m_dockEdge;

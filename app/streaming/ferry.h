@@ -38,7 +38,11 @@ public:
     static void sendHello();
     static void sendBlank(bool on);
     static void sendQuit();
-    static void sendReconnect(const QString& resolution, int fps, int bitrateMbps, bool bitrateAuto);
+    // Reconnect with a new quality/codec/audio handoff. The codec is one of
+    // "h264" | "hevc" | "hevc444" (see wb_AH_ipc_spec.md) and audioOnHost tells
+    // Ferry whether to keep the audio on the remote PC (--audio-on-host).
+    static void sendReconnect(const QString& resolution, int fps, int bitrateMbps, bool bitrateAuto,
+                              const QString& codec, bool audioOnHost);
     // Send dropped file paths together with the drop position in the remote
     // stream's coordinate space (pixels of the stream, 0..streamWidth/Height)
     // and the stream resolution, so the receiving Ferry can resolve which

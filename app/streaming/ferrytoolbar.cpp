@@ -27,6 +27,8 @@
 #define TOOLBAR_PROGRESS_W 48
 #define TOOLBAR_PROGRESS_H 40
 #define TOOLBAR_PROGRESS_THICK 6
+#define TOOLBAR_SEP_W 9
+#define TOOLBAR_SEP_H 9
 
 // Ferry dark-glass palette (mirrors the WPF settings / main window).
 static SDL_Color C_BAR_BG   = { 16, 27, 38, 255 };
@@ -60,6 +62,11 @@ FerryToolbar::FerryToolbar(Session* session)
       m_pendingFps(60),
       m_pendingBitrateMbps(20),
       m_pendingBitrateAuto(false),
+      m_codec("h264"),
+      m_pendingCodec("h264"),
+      m_audioOnHost(true),
+      m_hevcAvailable(true),
+      m_hevc444Available(false),
       m_dockEdge(DockTop),
       m_expanded(true),
       m_lastActivityTick(0),
@@ -240,6 +247,14 @@ void FerryToolbar::setQuality(const QString& resKey, int fps, int bitrateMbps, b
     render();
 }
 
+void FerryToolbar::setStreamOptions(const QString& codec, bool audioOnHost)
+{
+    m_codec = codec;
+    m_pendingCodec = codec;
+    m_audioOnHost = audioOnHost;
+    render();
+}
+
 void FerryToolbar::handleTransferProgress(const QJsonObject& obj)
 {
     if (obj.value("type").toString() != QLatin1String("transferProgress")) {
@@ -263,6 +278,40 @@ void FerryToolbar::handleTransferProgress(const QJsonObject& obj)
         }
     }
     render();
+}
+
+void FerryToolbar::handleFerryMessage(const QJsonObject& obj)
+{
+    const QString type = obj.value("type").toString();
+
+    if (type == QLatin1String("transferProgress")) {
+        handleTransferProgress(obj);
+    }
+    else if (type == QLatin1String("privacyState")) {
+        // Ferry confirms (or pushes) the black-screen privacy state so the
+        // toolbar button stays in sync with the actual host state.
+        m_privacy = obj.value("on").toBool();
+        render();
+    }
+    else if (type == QLatin1String("audioState")) {
+        m_audioOnHost = obj.value("onHost").toBool();
+        render();
+    }
+    else if (type == QLatin1String("codecCaps")) {
+        m_hevcAvailable = obj.value("hevc").toBool(true);
+        m_hevc444Available = obj.value("hevc444").toBool(false);
+        // Fall back to H.264 when a previously chosen codec just became
+        // unavailable on the peer.
+        auto fallback = [&](QString& codec) {
+            if ((codec == QLatin1String("hevc") && !m_hevcAvailable) ||
+                (codec == QLatin1String("hevc444") && !m_hevc444Available)) {
+                codec = QLatin1String("h264");
+            }
+        };
+        fallback(m_codec);
+        fallback(m_pendingCodec);
+        render();
+    }
 }
 
 static int textWidth(TTF_Font* font, const QString& text)
@@ -310,6 +359,7 @@ void FerryToolbar::layout()
 {
     TTF_Font* font = (TTF_Font*)m_font;
     m_items.clear();
+    m_separators.clear();
     m_showProgress = false;
     m_progressVertical = !isHorizontal();
 
@@ -327,6 +377,7 @@ void FerryToolbar::layout()
         it.selected = false;
         it.hover = false;
         it.danger = false;
+        it.disabled = false;
         it.rect = { M, M, C, C };
         m_items.append(it);
         m_surfaceW = C + 2 * M;
@@ -337,22 +388,37 @@ void FerryToolbar::layout()
     int x = M;
     int y = M;
 
-    QVector<QPair<ButtonId, bool>> mainButtons; // (id, danger)
-    mainButtons.append(qMakePair(BtnDrag, false));
-    mainButtons.append(qMakePair(BtnFullscreen, false));
-    mainButtons.append(qMakePair(BtnPrivacy, false));
-    mainButtons.append(qMakePair(BtnQuality, false));
-    mainButtons.append(qMakePair(BtnTransfer, false));
-    mainButtons.append(qMakePair(BtnEnd, true));
+    // Main button + separator sequence, matching the mockup A/B/C layout:
+    // drag / fullscreen / privacy / quality / audio | transfer (+progress) | end.
+    // BtnSeparator renders a 1px divider line and is not clickable.
+    const ButtonId sequence[] = {
+        BtnDrag, BtnFullscreen, BtnPrivacy, BtnQuality, BtnAudio,
+        BtnSeparator, BtnTransfer, BtnSeparator, BtnEnd
+    };
 
-    for (const auto& mb : mainButtons) {
+    for (ButtonId sid : sequence) {
+        if (sid == BtnSeparator) {
+            SDL_Rect sr;
+            if (horiz) {
+                sr = { x + TOOLBAR_SEP_W / 2, y + (C - 22) / 2, 1, 22 };
+                x += TOOLBAR_SEP_W + G;
+            }
+            else {
+                sr = { x + (C - 22) / 2, y + TOOLBAR_SEP_H / 2, 22, 1 };
+                y += TOOLBAR_SEP_H + G;
+            }
+            m_separators.append(sr);
+            continue;
+        }
+
         Item it;
-        it.id = mb.first;
-        it.label = (mb.first == BtnQuality) ? qualityLabel() : QString();
+        it.id = sid;
+        it.label = (sid == BtnQuality) ? qualityLabel() : QString();
         it.visible = true;
         it.selected = false;
         it.hover = false;
-        it.danger = mb.second;
+        it.danger = (sid == BtnEnd);
+        it.disabled = false;
         it.rect = { x, y, C, C };
         m_items.append(it);
 
@@ -360,11 +426,14 @@ void FerryToolbar::layout()
         else y += C + G;
 
         // Reserve inline space for the transfer progress bar.
-        if (mb.first == BtnTransfer && m_transferActive) {
+        if (sid == BtnTransfer && m_transferActive) {
             if (horiz) x += TOOLBAR_PROGRESS_W + G;
             else y += TOOLBAR_PROGRESS_H + G;
         }
     }
+
+    // Privacy button shows a persistent active state while the black screen is on.
+    if (Item* p = itemById(BtnPrivacy)) p->selected = m_privacy;
 
     int mainW = horiz ? (x - G + M) : (C + 2 * M);
     int mainH = horiz ? (C + 2 * M) : (y - G + M);
@@ -394,6 +463,9 @@ void FerryToolbar::layout()
             qMakePair(BtnRateAuto, "自动"), qMakePair(BtnRate10, "10 Mbps"),
             qMakePair(BtnRate20, "20 Mbps"), qMakePair(BtnRate40, "40 Mbps"),
             qMakePair(BtnRate80, "80 Mbps") } });
+        rows.append({ "编码", {
+            qMakePair(BtnCodecH264, "H.264"), qMakePair(BtnCodecHevc, "HEVC"),
+            qMakePair(BtnCodecHevc444, "HEVC 4:4:4") } });
 
         for (const ChipRow& row : rows) {
             int cx = px + titleW + 6;
@@ -407,6 +479,9 @@ void FerryToolbar::layout()
                 it.selected = false;
                 it.hover = false;
                 it.danger = false;
+                it.disabled = false;
+                if (chip.first == BtnCodecHevc) it.disabled = !m_hevcAvailable;
+                else if (chip.first == BtnCodecHevc444) it.disabled = !m_hevc444Available;
                 it.rect = { cx, cursor, w, rowH };
                 m_items.append(it);
                 cx += w + G;
@@ -422,6 +497,7 @@ void FerryToolbar::layout()
         apply.selected = false;
         apply.hover = false;
         apply.danger = false;
+        apply.disabled = false;
         int ax = px + titleW + 6;
         apply.rect = { ax, cursor, textWidth(font, apply.label) + 12, rowH };
         m_items.append(apply);
@@ -433,6 +509,7 @@ void FerryToolbar::layout()
         cancel.selected = false;
         cancel.hover = false;
         cancel.danger = false;
+        cancel.disabled = false;
         cancel.rect = { apply.rect.x + apply.rect.w + G, cursor, textWidth(font, cancel.label) + 12, rowH };
         m_items.append(cancel);
 
@@ -462,6 +539,10 @@ void FerryToolbar::layout()
         else if (m_pendingBitrateMbps == 20) sel(BtnRate20);
         else if (m_pendingBitrateMbps == 40) sel(BtnRate40);
         else if (m_pendingBitrateMbps == 80) sel(BtnRate80);
+
+        if (m_pendingCodec == QLatin1String("h264")) sel(BtnCodecH264);
+        else if (m_pendingCodec == QLatin1String("hevc") && m_hevcAvailable) sel(BtnCodecHevc);
+        else if (m_pendingCodec == QLatin1String("hevc444") && m_hevc444Available) sel(BtnCodecHevc444);
     }
 }
 
@@ -573,6 +654,34 @@ void FerryToolbar::drawIcon(SDL_Surface* dst, ButtonId id, const SDL_Rect& r, SD
         drawLine(dst, cx + s, cy - s, cx - s, cy + s, c);
         break;
 
+    case BtnAudio: {
+        // Speaker: right-facing box + left-pointing cone.
+        drawLine(dst, cx - 1, cy - 4, cx - 1, cy + 4, c); // front face
+        drawLine(dst, cx - 1, cy - 4, cx - 5, cy - 4, c); // top
+        drawLine(dst, cx - 1, cy + 4, cx - 5, cy + 4, c); // bottom
+        drawLine(dst, cx - 5, cy - 4, cx - 8, cy - 7, c); // cone top
+        drawLine(dst, cx - 8, cy - 7, cx - 8, cy + 7, c); // cone back
+        drawLine(dst, cx - 5, cy + 4, cx - 8, cy + 7, c); // cone bottom
+        if (!m_audioOnHost) {
+            // Sound plays on this machine: two sound-wave arcs to the right.
+            for (int rr = 3; rr <= 5; rr += 2) {
+                for (int yy = -rr; yy <= rr; yy++) {
+                    for (int xx = 0; xx <= rr; xx++) {
+                        int d2 = xx * xx + yy * yy;
+                        if (d2 <= rr * rr && d2 >= (rr - 1) * (rr - 1)) {
+                            putPixel(dst, cx + 1 + xx, cy + yy, c);
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            // Sound stays on the host: slash through the speaker.
+            drawLine(dst, cx - 6, cy + 7, cx + 1, cy - 7, c);
+        }
+        break;
+    }
+
     default:
         break;
     }
@@ -630,8 +739,9 @@ void FerryToolbar::render()
             continue;
         }
 
-        // Subtle rounded highlight on hover (or selected chip).
-        if (item.hover || item.selected) {
+        // Subtle rounded highlight on hover (or selected chip). Disabled chips
+        // get no highlight so they read as unavailable.
+        if ((item.hover || item.selected) && !item.disabled) {
             SDL_Color bg = item.danger ? C_DANGER : (item.selected ? C_ACCENT : C_HOVER);
             SDL_Rect hi = { item.rect.x + 1, item.rect.y + 1, item.rect.w - 2, item.rect.h - 2 };
             fillRoundedRect(surface, hi, 6, bg);
@@ -649,16 +759,27 @@ void FerryToolbar::render()
                  item.id != BtnFps30 && item.id != BtnFps60 && item.id != BtnFps120 &&
                  item.id != BtnRateAuto && item.id != BtnRate10 && item.id != BtnRate20 &&
                  item.id != BtnRate40 && item.id != BtnRate80 &&
+                 item.id != BtnCodecH264 && item.id != BtnCodecHevc && item.id != BtnCodecHevc444 &&
                  item.id != BtnApply && item.id != BtnCancel) {
-            drawIcon(surface, item.id, item.rect, C_ICON);
+            // Line icon. The close button is red; the audio button is muted
+            // gray while sound stays on the host.
+            SDL_Color iconColor = C_ICON;
+            if (item.id == BtnEnd) iconColor = C_DANGER;
+            else if (item.id == BtnAudio && m_audioOnHost) iconColor = C_MUTED;
+            drawIcon(surface, item.id, item.rect, iconColor);
         }
         else {
-            // Text chip (quality panel).
+            // Text chip (quality panel). Disabled chips render gray.
             int tw = textWidth((TTF_Font*)m_font, item.label);
             int tx = item.rect.x + (item.rect.w - tw) / 2;
             int ty = item.rect.y + (item.rect.h - m_fontSize - 2) / 2;
-            blitText(surface, item.label, C_ICON, tx, ty);
+            blitText(surface, item.label, item.disabled ? C_MUTED : C_ICON, tx, ty);
         }
+    }
+
+    // Divider lines between button groups.
+    for (const SDL_Rect& sr : m_separators) {
+        SDL_FillRect(surface, &sr, SDL_MapRGBA(surface->format, C_MUTED.r, C_MUTED.g, C_MUTED.b, C_MUTED.a));
     }
 
     // Transfer progress bar, adjacent to the transfer button.
@@ -1031,7 +1152,7 @@ bool FerryToolbar::handleMouseButton(const SDL_MouseButtonEvent* ev)
 
     if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button == SDL_BUTTON_LEFT) {
         Item* item = itemAt(ev->x, ev->y);
-        if (item != nullptr) {
+        if (item != nullptr && !item->disabled) {
             item->hover = true;
             if (item->id == BtnDrag) {
                 // Begin dragging the toolbar.
@@ -1075,7 +1196,7 @@ bool FerryToolbar::handleMouseMotion(const SDL_MouseMotionEvent* ev)
     Item* hit = itemAt(ev->x, ev->y);
     bool changed = false;
     for (Item& item : m_items) {
-        bool hov = (&item == hit);
+        bool hov = (&item == hit) && !item.disabled;
         if (item.hover != hov) changed = true;
         item.hover = hov;
     }
@@ -1110,7 +1231,17 @@ void FerryToolbar::onButton(ButtonId id)
         m_pendingFps = m_fps;
         m_pendingBitrateMbps = m_bitrateMbps;
         m_pendingBitrateAuto = m_bitrateAuto;
+        m_pendingCodec = m_codec;
         render();
+        break;
+
+    case BtnAudio:
+        // Toggle whether audio stays on the host. Changing --audio-on-host
+        // requires relaunching Moonlight, so this reconnects immediately with
+        // the current quality/codec and the new audio state.
+        m_audioOnHost = !m_audioOnHost;
+        render();
+        sendReconnectCurrent();
         break;
 
     case BtnTransfer:
@@ -1149,14 +1280,31 @@ void FerryToolbar::onButton(ButtonId id)
     case BtnRate40: m_pendingBitrateAuto = false; m_pendingBitrateMbps = 40; render(); break;
     case BtnRate80: m_pendingBitrateAuto = false; m_pendingBitrateMbps = 80; render(); break;
 
+    case BtnCodecH264:
+        // H.264 is always available.
+        m_pendingCodec = "h264";
+        render();
+        break;
+    case BtnCodecHevc:
+        if (!m_hevcAvailable) break;
+        m_pendingCodec = "hevc";
+        render();
+        break;
+    case BtnCodecHevc444:
+        if (!m_hevc444Available) break;
+        m_pendingCodec = "hevc444";
+        render();
+        break;
+
     case BtnApply:
         m_resKey = m_pendingResKey;
         m_fps = m_pendingFps;
         m_bitrateMbps = m_pendingBitrateMbps;
         m_bitrateAuto = m_pendingBitrateAuto;
+        m_codec = m_pendingCodec;
         m_qualityOpen = false;
         render();
-        FerryBridge::sendReconnect(m_resKey, m_fps, m_bitrateMbps, m_bitrateAuto);
+        sendReconnectCurrent();
         break;
 
     case BtnCancel:
@@ -1165,10 +1313,17 @@ void FerryToolbar::onButton(ButtonId id)
         m_pendingFps = m_fps;
         m_pendingBitrateMbps = m_bitrateMbps;
         m_pendingBitrateAuto = m_bitrateAuto;
+        m_pendingCodec = m_codec;
         render();
         break;
 
     default:
         break;
     }
+}
+
+void FerryToolbar::sendReconnectCurrent()
+{
+    FerryBridge::sendReconnect(m_resKey, m_fps, m_bitrateMbps, m_bitrateAuto,
+                               m_codec, m_audioOnHost);
 }
