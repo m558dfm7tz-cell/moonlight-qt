@@ -2,6 +2,7 @@
 #include "backend/computermanager.h"
 #include "backend/computerseeker.h"
 #include "streaming/session.h"
+#include "streaming/ferry.h"
 
 #include <QCoreApplication>
 #include <QTimer>
@@ -86,10 +87,19 @@ public:
                     emit q->searchingApp();
                 } else {
                     m_State = StateFailure;
-                    QString msg = QObject::tr("Computer %1 has not been paired. "
-                                              "Please open Moonlight to pair before streaming.")
-                            .arg(event.computer->name);
-                    emit q->failed(msg);
+                    if (FerryBridge::isEnabled()) {
+                        // Ferry mode: don't show a localized dialog here.
+                        // Notify Ferry so it can auto-repair and retry; Ferry
+                        // explains any failure in Chinese. The empty failure
+                        // text makes the QML segue quit silently.
+                        FerryBridge::sendNeedPair();
+                        emit q->failed(QString());
+                    } else {
+                        QString msg = QObject::tr("Computer %1 has not been paired. "
+                                                  "Please open Moonlight to pair before streaming.")
+                                .arg(event.computer->name);
+                        emit q->failed(msg);
+                    }
                 }
             }
             break;

@@ -35,6 +35,7 @@ public:
     static void sendReconnect(const QString& resolution, int fps, int bitrateMbps, bool bitrateAuto);
     static void sendFiles(const QStringList& paths);
     static void sendStatus(const QString& text);
+    static void sendNeedPair();
 
 private:
     static QTcpSocket* socket();

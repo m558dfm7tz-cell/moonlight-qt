@@ -88,3 +88,10 @@ void FerryBridge::sendStatus(const QString& text)
     obj.insert("text", text);
     send(obj);
 }
+
+void FerryBridge::sendNeedPair()
+{
+    QJsonObject obj;
+    obj.insert("type", "needpair");
+    send(obj);
+}

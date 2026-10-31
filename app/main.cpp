@@ -432,7 +432,25 @@ int main(int argc, char *argv[])
     QCoreApplication::setOrganizationDomain("moonlight-stream.com");
     QCoreApplication::setApplicationName("Moonlight");
 
-    if (QFile(QDir::currentPath() + "/portable.dat").exists()) {
+    // Ferry: when Ferry launches us with a dedicated per-computer data
+    // directory (FERRY_MOONLIGHT_DATA_DIR), store Moonlight's identity
+    // (Moonlight.ini) there instead of next to the executable, so switching
+    // test packages never loses the Sunshine/Moonlight pairing. The directory
+    // is never shipped with the package, so every computer still generates its
+    // own identity on first run.
+    QByteArray ferryDataDir = qgetenv("FERRY_MOONLIGHT_DATA_DIR");
+
+    if (!ferryDataDir.isEmpty()) {
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope,
+                           QString::fromUtf8(ferryDataDir));
+        QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope,
+                           QString::fromUtf8(ferryDataDir));
+
+        // Initialize paths for portable mode
+        Path::initialize(true);
+    }
+    else if (QFile(QDir::currentPath() + "/portable.dat").exists()) {
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, QDir::currentPath());
         QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, QDir::currentPath());
@@ -864,6 +882,11 @@ int main(int argc, char *argv[])
         SDL_SetHint("SDL_KMSDRM_ATOMIC", "0");
 #endif
     }
+
+    // Ferry: force the Simplified Chinese UI for the self-built Moonlight so
+    // the user always sees Chinese text instead of the OS locale (e.g. a
+    // Japanese system would otherwise show Japanese).
+    StreamingPreferences::get()->language = StreamingPreferences::LANG_ZH_CN;
 
     // Apply the initial translation based on user preference
     StreamingPreferences::get()->retranslate();

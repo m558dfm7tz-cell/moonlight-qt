@@ -23,6 +23,13 @@ Item {
     }
 
     function onLaunchFailed(message) {
+        // Ferry mode reports an empty message when it hands control back to
+        // Ferry for automatic re-pairing; quit silently in that case instead
+        // of showing an empty (localized) dialog.
+        if (message.length === 0) {
+            Qt.quit()
+            return
+        }
         errorDialog.text = message
         errorDialog.open()
         console.error(message)
