@@ -971,7 +971,8 @@ void FerryToolbar::render()
 
     // Transfer progress bar adjacent to the transfer button.
     m_showProgress = false;
-    if (m_transferActive || (SDL_GetTicks() - m_transferDoneTick) < TOOLBAR_DONE_FLASH_MS) {
+    if (m_transferActive ||
+        (m_transferDoneTick != 0 && (SDL_GetTicks() - m_transferDoneTick) < TOOLBAR_DONE_FLASH_MS)) {
         if (Item* transfer = itemById(BtnTransfer)) {
             m_showProgress = true;
             m_progressVertical = !isHorizontal();

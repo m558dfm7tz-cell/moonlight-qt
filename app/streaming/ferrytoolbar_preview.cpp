@@ -3,6 +3,7 @@
 #include "ferrytoolbar.h"
 
 #include "SDL_compat.h"
+#include <SDL_ttf.h>
 
 #include <QDir>
 #include <QImage>
@@ -57,23 +58,33 @@ int runFerryToolbarPreview(const QString& outDir)
 #ifdef Q_OS_WIN32
     QDir().mkpath(outDir);
 
+    // The toolbar loads a CJK system font via SDL_ttf; in normal streaming the
+    // Session's OverlayManager initializes SDL_ttf, but the preview has no
+    // Session so we initialize it here.
+    if (TTF_Init() != 0) {
+        return 1;
+    }
+
     // A plain "stream" window behind the toolbar so the translucent capsule and
     // its rounded (transparent) corners are clearly visible against a known
-    // mid-tone background.
+    // light background. Always-on-top keeps it above any maximized app window
+    // on the test machine (the toolbar itself is created afterwards, so it
+    // still stacks above this window).
     SDL_Window* streamWin = SDL_CreateWindow("FerryPreviewStream",
-                                             120, 120, 960, 640,
-                                             SDL_WINDOW_BORDERLESS);
+                                             100, 100, 1100, 760,
+                                             SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP);
     if (streamWin == nullptr) {
+        TTF_Quit();
         return 1;
     }
     SDL_Surface* ws = SDL_GetWindowSurface(streamWin);
     if (ws != nullptr) {
-        SDL_FillRect(ws, nullptr, SDL_MapRGB(ws->format, 96, 116, 144));
+        SDL_FillRect(ws, nullptr, SDL_MapRGB(ws->format, 205, 212, 222));
         SDL_UpdateWindowSurface(streamWin);
     }
     SDL_RaiseWindow(streamWin);
     SDL_PumpEvents();
-    SDL_Delay(200);
+    SDL_Delay(300);
 
     FerryToolbar* tb = new FerryToolbar(nullptr);
     if (!tb->init(streamWin)) {
@@ -139,6 +150,7 @@ int runFerryToolbarPreview(const QString& outDir)
     tb->destroy();
     delete tb;
     SDL_DestroyWindow(streamWin);
+    TTF_Quit();
     return 0;
 #else
     return 1;
