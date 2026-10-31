@@ -529,9 +529,34 @@ void FerryToolbar::followTo(int wx, int wy, int ww)
     if (!m_visible) {
         return;
     }
-    int tx = wx + (ww - m_surfaceW) / 2;
-    if (tx < wx) tx = wx;
-    int ty = wy + 2;
+
+    // Start from the outer window rect passed in (wx/wy are the frame origin).
+    int cx = wx;
+    int cw = ww;
+    int cy = wy;
+
+#ifdef Q_OS_WIN32
+    // Keep the toolbar inside the stream window's CLIENT area (the video
+    // region). In windowed mode wx/wy include the title bar and frame, so
+    // measure the client rect directly instead of guessing the decoration size.
+    if (m_streamHwnd != nullptr) {
+        RECT rc;
+        if (GetClientRect((HWND)m_streamHwnd, &rc)) {
+            POINT pt;
+            pt.x = rc.left;
+            pt.y = rc.top;
+            if (ClientToScreen((HWND)m_streamHwnd, &pt)) {
+                cx = pt.x;
+                cy = pt.y;
+                cw = rc.right - rc.left;
+            }
+        }
+    }
+#endif
+
+    int tx = cx + (cw - m_surfaceW) / 2;
+    if (tx < cx) tx = cx;
+    int ty = cy + 2;
     SDL_SetWindowPosition(m_window, tx, ty);
 }
 
