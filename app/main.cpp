@@ -1,6 +1,13 @@
 #include <QGuiApplication>
 #include <QStyleHints>
 #include <QQmlApplicationEngine>
+#include <QQmlComponent>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QFile>
+#include <QElapsedTimer>
+#include <QDirIterator>
 #include <QQmlContext>
 #include <QIcon>
 #include <QQuickStyle>
@@ -1040,6 +1047,37 @@ int main(int argc, char *argv[])
     }
 
     QQmlApplicationEngine engine;
+    // Packaging check: compile components without creating windows, executing
+    // Component.onCompleted, or connecting to any remote host.
+    QByteArray resourceCheckPath = qgetenv("FERRY_RESOURCE_CHECK");
+    if (!resourceCheckPath.isEmpty()) {
+        QJsonArray files, errors;
+        bool ok = true;
+        QDirIterator resources(":", QDirIterator::Subdirectories);
+        while (resources.hasNext()) {
+            const QString path = resources.next();
+            if (QFileInfo(path).isFile()) files.append(path);
+        }
+        for (const QString& path : {QStringLiteral("qrc:/gui/CliStream.qml"),
+                                   QStringLiteral("qrc:/gui/CliStartStreamSegue.qml"),
+                                   QStringLiteral("qrc:/gui/StreamSegue.qml"),
+                                   QStringLiteral("qrc:/gui/CliPair.qml"),
+                                   QStringLiteral("qrc:/gui/main.qml")}) {
+            QQmlComponent component(&engine, QUrl(path));
+            QElapsedTimer clock; clock.start();
+            while (component.isLoading() && clock.elapsed() < 5000)
+                app.processEvents();
+            if (!component.isReady()) {
+                ok = false;
+                for (const auto& error : component.errors()) errors.append(error.toString());
+                if (component.errors().isEmpty()) errors.append(path + ": component not ready");
+            }
+        }
+        QFile output(QString::fromUtf8(resourceCheckPath));
+        if (!output.open(QIODevice::WriteOnly)) return 3;
+        output.write(QJsonDocument(QJsonObject{{"ok", ok}, {"files", files}, {"errors", errors}}).toJson());
+        return ok ? 0 : 2;
+    }
     QString initialView;
     bool hasGUI = true;
 
