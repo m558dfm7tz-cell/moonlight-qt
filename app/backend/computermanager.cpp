@@ -44,7 +44,8 @@ private:
 
         // Ensure the machine that responded is the one we intended to contact
         if (m_Computer->uuid != newState.uuid) {
-            qInfo() << "Found unexpected PC" << newState.name << "looking for" << m_Computer->name;
+            qInfo() << "Found unexpected PC" << newState.name << "looking for" << m_Computer->name
+                    << "(host identity UUID mismatch)";
             return false;
         }
 

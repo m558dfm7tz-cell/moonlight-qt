@@ -104,7 +104,21 @@ void FerryBridge::sendNeedPair()
 {
     QJsonObject obj;
     obj.insert("type", "needpair");
+    qInfo() << "[FerryPair] authentication requires re-pairing";
     send(obj);
+    // Do not exit before Ferry consumes the recovery request.
+    QTcpSocket* s = socket();
+    if (!s_connected) return;
+    if (s->bytesToWrite() > 0) s->waitForBytesWritten(1000);
+    QByteArray replies;
+    for (int i = 0; i < 10; ++i) {
+        if (s->bytesAvailable() == 0) s->waitForReadyRead(100);
+        replies.append(s->readAll());
+        if (replies.contains("needpairAck")) {
+            qInfo() << "[FerryPair] recovery request acknowledged";
+            break;
+        }
+    }
 }
 
 void FerryBridge::sendDragOut()

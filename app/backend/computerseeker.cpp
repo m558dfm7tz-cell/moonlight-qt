@@ -1,5 +1,6 @@
 #include "computerseeker.h"
 #include "computermanager.h"
+#include "streaming/ferry.h"
 #include <QTimer>
 
 ComputerSeeker::ComputerSeeker(ComputerManager *manager, QString computerName, QObject *parent)
@@ -28,7 +29,7 @@ void ComputerSeeker::start(int timeout)
     //
     // NB: We don't do this unconditionally because it will wipe out the user's
     // manual address if they pass another reachable hostname/address.
-    if (!findMatchingComputer()) {
+    if (FerryBridge::isEnabled() || !findMatchingComputer()) {
         m_ComputerManager->addNewHostManually(m_ComputerName);
     }
 
