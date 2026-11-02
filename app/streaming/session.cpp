@@ -31,6 +31,11 @@
 #define SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED 104
 #define SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS 105
 
+#ifdef Q_OS_WIN32
+#include <SDL_syswm.h>
+#include <windows.h>
+#endif
+
 #include <openssl/rand.h>
 
 #include <QtEndian>
@@ -2470,7 +2475,7 @@ void Session::exec()
                 QStringList files;
                 files.append(QString::fromUtf8(event.drop.file));
 
-                int streamX = 0, streamY = 0;
+                int streamX = -1, streamY = -1;
                 int streamW = m_StreamConfig.width;
                 int streamH = m_StreamConfig.height;
                 if (streamW > 0 && streamH > 0) {
@@ -2486,19 +2491,43 @@ void Session::exec()
                     dst.h = windowH;
                     StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
 
-                    // SDL 2.24+ removed the x/y fields from SDL_DropEvent, so read
-                    // the pointer position (window-relative, same space as mouse
-                    // events) at drop time and map it into stream space, clamping
-                    // to the stream bounds so the host always receives a valid point.
-                    int dropX, dropY;
-                    SDL_GetMouseState(&dropX, &dropY);
-                    int localX = dropX - dst.x;
-                    int localY = dropY - dst.y;
-                    if (dst.w > 0) streamX = qMin(qMax(localX * streamW / dst.w, 0), streamW - 1);
-                    if (dst.h > 0) streamY = qMin(qMax(localY * streamH / dst.h, 0), streamH - 1);
+                    // During an OLE drop SDL's cached mouse coordinates may still
+                    // belong to a different window (including the toolbar).
+                    // Query the OS and convert to this stream window's client area.
+                    int dropX = 0, dropY = 0;
+                    bool pointOk = false;
+#ifdef Q_OS_WIN32
+                    SDL_SysWMinfo info;
+                    SDL_VERSION(&info.version);
+                    POINT point;
+                    RECT client;
+                    if (SDL_GetWindowWMInfo(m_Window, &info) && info.subsystem == SDL_SYSWM_WINDOWS &&
+                        GetCursorPos(&point) && ScreenToClient(info.info.win.window, &point) &&
+                        GetClientRect(info.info.win.window, &client) && client.right > 0 && client.bottom > 0) {
+                        // Native client pixels -> SDL window units (DPI aware).
+                        dropX = (int)((qint64)point.x * windowW / client.right);
+                        dropY = (int)((qint64)point.y * windowH / client.bottom);
+                        pointOk = true;
+                    }
+#else
+                    int gx, gy, wx, wy;
+                    SDL_GetGlobalMouseState(&gx, &gy);
+                    SDL_GetWindowPosition(m_Window, &wx, &wy);
+                    dropX = gx - wx; dropY = gy - wy; pointOk = true;
+#endif
+                    if (pointOk && dst.w > 0 && dst.h > 0 &&
+                        dropX >= dst.x && dropX < dst.x + dst.w &&
+                        dropY >= dst.y && dropY < dst.y + dst.h) {
+                        streamX = (int)((qint64)(dropX - dst.x) * streamW / dst.w);
+                        streamY = (int)((qint64)(dropY - dst.y) * streamH / dst.h);
+                    }
+                    qInfo() << "[FerryDrop]" << dropX << dropY << "stream" << streamX << streamY
+                            << "size" << streamW << streamH;
                 }
 
-                FerryBridge::sendFiles(files, streamX, streamY, streamW, streamH);
+                // Never turn an invalid/black-bar drop into a desktop-edge drop.
+                if (streamX >= 0 && streamY >= 0)
+                    FerryBridge::sendFiles(files, streamX, streamY, streamW, streamH);
                 // Transfer progress is now shown on the toolbar's transfer
                 // button via Ferry's transferProgress messages, so no static
                 // "sending" text is needed here.

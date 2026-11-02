@@ -32,6 +32,7 @@
 
 #if defined(Q_OS_WIN32)
 #include "antihookingprotection.h"
+#include <stdlib.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -440,14 +441,22 @@ int main(int argc, char *argv[])
     // test packages never loses the Sunshine/Moonlight pairing. The directory
     // is never shipped with the package, so every computer still generates its
     // own identity on first run.
-    QByteArray ferryDataDir = qgetenv("FERRY_MOONLIGHT_DATA_DIR");
+#if defined(Q_OS_WIN32)
+    // Ferry supplies a Unicode environment value. Avoid decoding ANSI bytes
+    // as UTF-8 when the data directory contains non-ASCII characters.
+    const wchar_t* ferryDataDirEnv = _wgetenv(L"FERRY_MOONLIGHT_DATA_DIR");
+    const QString ferryDataDir = ferryDataDirEnv
+            ? QString::fromWCharArray(ferryDataDirEnv) : QString();
+#else
+    const QString ferryDataDir = QString::fromUtf8(qgetenv("FERRY_MOONLIGHT_DATA_DIR"));
+#endif
 
     if (!ferryDataDir.isEmpty()) {
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope,
-                           QString::fromUtf8(ferryDataDir));
+                           ferryDataDir);
         QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope,
-                           QString::fromUtf8(ferryDataDir));
+                           ferryDataDir);
 
         // Initialize paths for portable mode
         Path::initialize(true);

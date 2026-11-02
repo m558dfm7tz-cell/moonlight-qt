@@ -8,6 +8,7 @@
 #include <QPair>
 #include <QImage>
 #include <QJsonObject>
+#include <QRect>
 
 class Session;
 
@@ -19,10 +20,10 @@ class Session;
 // so the capsule corners are truly transparent and anti-aliased and the
 // background is genuinely translucent — unlike the previous whole-window-opacity
 // + SetWindowRgn approach which produced an opaque dark rectangle with aliased
-// corners. Button icons are pre-rendered PNG assets (4x logical size) that are
-// scaled per devicePixelRatio so they stay crisp at 100/150/200% scaling.
+// corners. Button icons are rasterized from QPainter paths at devicePixelRatio, with
+// one 1.75 logical-pixel pen and round caps/joins.
 //
-// Button order: drag handle / fullscreen / black-screen privacy / quality (HD) /
+// Button order: drag handle / fullscreen / black-screen privacy / quality sliders /
 // audio | separator | transfer (with progress bar) | separator | close. The bar
 // can be dragged and docked to any of the four edges of the stream window; when
 // docked left or right the buttons are laid out vertically. Moving the pointer
@@ -40,7 +41,10 @@ public:
     explicit FerryToolbar(Session* session);
     ~FerryToolbar();
 
-    bool init(SDL_Window* streamWindow);
+    bool init(SDL_Window* streamWindow, bool offscreen = false);
+    QImage debugSnapshot() const;
+    QJsonObject debugMetrics();
+    void debugMotion(unsigned elapsed);
     void destroy();
 
     Uint32 windowId() const { return m_windowId; }
@@ -119,6 +123,10 @@ private:
     };
 
     void layout();
+    void placeLayout();
+    QRect placementBounds();
+    QRect screenBounds();
+    float selectionAlpha(int id,bool selected);
     void render();
     void present(); // per-pixel-alpha layered present (Windows) / SDL surface present
     void blitText(SDL_Surface* dst, const QString& text, SDL_Color color, int x, int y);
@@ -150,6 +158,14 @@ private:
     void dockToNearestEdge();
     bool isHorizontal() const { return m_dockEdge == DockTop || m_dockEdge == DockBottom; }
 
+    bool m_offscreen=false;
+    int m_barX=0,m_barY=0,m_canvasX=0,m_canvasY=0;
+    QRect m_layoutBounds;
+    bool m_handleHover=false;
+    int m_pressedId=-1;
+    Uint32 m_pressTick=0,m_revealTick=0;
+    struct SelectionFade { float from=0,to=0; Uint32 tick=0; };
+    QHash<int,SelectionFade> m_selectionFades;
     Session* m_session;
     SDL_Window* m_streamWindow;
     SDL_Window* m_window;
