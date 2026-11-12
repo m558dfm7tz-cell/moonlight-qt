@@ -6,6 +6,9 @@
 #include "streaming/ferrytoolbar.h"
 #include "backend/richpresencemanager.h"
 
+// Implementation-only toolbar animation timing (keeps ferrytoolbar.h unchanged).
+int ferryToolbarWaitTimeout(const FerryToolbar* toolbar);
+
 #include <Limelight.h>
 #include "SDL_compat.h"
 #include "utils.h"
@@ -16,13 +19,6 @@
 
 #ifdef HAVE_SLVIDEO
 #include "video/slvid.h"
-#endif
-
-#ifdef Q_OS_WIN32
-// Scaling the icon down on Win32 looks dreadful, so render at lower res
-#define ICON_SIZE 32
-#else
-#define ICON_SIZE 64
 #endif
 
 #define SDL_CODE_FLUSH_WINDOW_EVENT_BARRIER 100
@@ -42,8 +38,6 @@
 #include <QtEndian>
 #include <QCoreApplication>
 #include <QThreadPool>
-#include <QSvgRenderer>
-#include <QPainter>
 #include <QImage>
 #include <QGuiApplication>
 #include <QCursor>
@@ -2000,17 +1994,12 @@ void Session::exec()
         });
     }
 
-    QSvgRenderer svgIconRenderer(QString(":/res/moonlight.svg"));
-    QImage svgImage(ICON_SIZE, ICON_SIZE, QImage::Format_RGBA8888);
-    svgImage.fill(0);
-
-    QPainter svgPainter(&svgImage);
-    svgIconRenderer.render(&svgPainter);
-    SDL_Surface* iconSurface = SDL_CreateRGBSurfaceWithFormatFrom((void*)svgImage.constBits(),
-                                                                  svgImage.width(),
-                                                                  svgImage.height(),
+    QImage windowIcon = QImage(":/res/ferry.png").convertToFormat(QImage::Format_RGBA8888);
+    SDL_Surface* iconSurface = windowIcon.isNull() ? nullptr : SDL_CreateRGBSurfaceWithFormatFrom((void*)windowIcon.constBits(),
+                                                                  windowIcon.width(),
+                                                                  windowIcon.height(),
                                                                   32,
-                                                                  4 * svgImage.width(),
+                                                                  windowIcon.bytesPerLine(),
                                                                   SDL_PIXELFORMAT_RGBA32);
 #ifndef Q_OS_DARWIN
     // Other platforms seem to preserve our Qt icon when creating a new window.
@@ -2102,7 +2091,7 @@ void Session::exec()
         // NB: This behavior was introduced in SDL 2.0.16, but had a few critical
         // issues that could cause indefinite timeouts, delayed joystick detection,
         // and other problems.
-        if (!SDL_WaitEventTimeout(&event, 1000)) {
+        if (!SDL_WaitEventTimeout(&event, ferryToolbarWaitTimeout(m_Toolbar))) {
             presence.runCallbacks();
             continue;
         }

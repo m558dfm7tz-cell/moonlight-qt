@@ -19,6 +19,54 @@
 #include <QtGlobal>
 #include <QtMath>
 #include <cmath>
+#include <QDataStream>
+#include <QScopeGuard>
+#include <functional>
+#include <map>
+
+namespace {
+// Toolbar operations and the SDL message hook run on the SDL/UI thread.
+// Keep implementation-only caches here so the public toolbar API is unchanged.
+struct ToolbarCache {
+    struct Raster { QByteArray key; QImage image; } raster[2];
+    QByteArray layoutKey;
+    QByteArray currentKey;
+    QSize baseSize;
+    bool dirty = true, drawing = false, flushing = false;
+    bool pixelsDirty = true, shortWait = false, pixelsAnimating = false;
+    int x = 0, y = 0, alpha = -1;
+    std::function<void()> warmIcons;
+#ifdef Q_OS_WIN32
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ oldBitmap = nullptr;
+    void* bits = nullptr;
+    int width = 0, height = 0;
+#endif
+    void release() {
+#ifdef Q_OS_WIN32
+        if (dc != nullptr) {
+            if (oldBitmap != nullptr) SelectObject(dc, oldBitmap);
+            if (bitmap != nullptr) DeleteObject(bitmap);
+            DeleteDC(dc);
+        }
+        dc = nullptr; bitmap = nullptr; oldBitmap = nullptr; bits = nullptr;
+        width = height = 0;
+#endif
+        alpha = -1;
+        pixelsDirty = true;
+    }
+    ~ToolbarCache() { release(); }
+};
+std::map<const FerryToolbar*, ToolbarCache> toolbarCaches;
+}
+
+// Used only by the session's existing SDL wait; steady-state stays at 1000 ms.
+int ferryToolbarWaitTimeout(const FerryToolbar* toolbar)
+{
+    auto it = toolbarCaches.find(toolbar);
+    return it != toolbarCaches.end() && it->second.shortWait ? 16 : 1000;
+}
 
 // Logical sizes (scaled by devicePixelRatio at layout/render time).
 #define TOOLBAR_FONT_SIZE 13
@@ -224,11 +272,63 @@ bool FerryToolbar::init(SDL_Window* streamWindow, bool offscreen)
     m_lastActivityTick = SDL_GetTicks();
     if(!offscreen)m_revealTick=m_lastActivityTick;
 
+    // Cache the small set of raster sizes used by the press animation,
+    // including the three audio states, before the first interactive frame.
+    auto& cache = toolbarCaches[this];
+    cache.warmIcons = [this]() {
+        auto drawIcon = [this](ButtonId id, int size) {
+            QImage icon(size,size,QImage::Format_ARGB32_Premultiplied);icon.fill(Qt::transparent);
+            QPainter p(&icon);p.setRenderHint(QPainter::Antialiasing);p.setWindow(0,0,26,26);
+            QColor color=id==BtnEnd?QColor(229,72,77):(id==BtnAudio&&m_audioOnHost?QColor(149,168,185):QColor(241,246,253));
+            p.setPen(QPen(color,1.75,Qt::SolidLine,Qt::RoundCap,Qt::RoundJoin));p.setBrush(Qt::NoBrush);
+            auto line=[&](double x,double y,double xx,double yy){p.drawLine(QPointF(x,y),QPointF(xx,yy));};
+            switch(id){
+            case BtnDrag:p.setBrush(color);for(int x:{7,13,19})p.drawEllipse(QPointF(x,13),.9,.9);break;
+            case BtnFullscreen:
+                for(int x:{5,21})for(int y:{5,21}){line(x,y,x+(x==5?5:-5),y);line(x,y,x,y+(y==5?5:-5));}break;
+            case BtnPrivacy:{
+                p.drawRoundedRect(QRectF(3,4,17,13),2,2);line(11,17,11,21);line(7,21,14,21);
+                p.setCompositionMode(QPainter::CompositionMode_Clear);p.fillRect(QRectF(15,10,11,15),Qt::transparent);p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                p.drawRoundedRect(QRectF(16,14,8,8),1.5,1.5);p.drawArc(QRectF(18,10,4,7),0,180*16);line(20,17,20,19);break;
+            }
+            case BtnQuality:
+                for(auto pair:{qMakePair(7,9),qMakePair(13,17),qMakePair(19,11)}){line(4,pair.first,pair.second-2,pair.first);line(pair.second+2,pair.first,22,pair.first);p.drawEllipse(QPointF(pair.second,pair.first),2,2);}break;
+            case BtnAudio:{
+                QPainterPath path;path.moveTo(3,10);path.lineTo(7,10);path.lineTo(12,6);path.lineTo(12,20);path.lineTo(7,16);path.lineTo(3,16);path.closeSubpath();p.drawPath(path);
+                if(m_audioMutedLocal&&!m_audioOnHost)line(4,3,23,23);
+                else {p.drawArc(QRectF(10,8,10,10),-55*16,110*16);p.drawArc(QRectF(10,4,16,18),-55*16,110*16);}break;
+            }
+            case BtnTransfer:{QPainterPath path;path.moveTo(4,17);path.lineTo(4,22);path.lineTo(22,22);path.lineTo(22,17);p.drawPath(path);line(13,17,13,4);line(8,9,13,4);line(13,4,18,9);break;}
+            case BtnEnd:line(6,6,20,20);line(20,6,6,20);break;
+            default:break;
+            }
+            p.end();
+            return icon.convertToFormat(QImage::Format_RGBA8888);
+        };
+        const bool hostAudio = m_audioOnHost, muted = m_audioMutedLocal;
+        for (int width = qRound(S(TOOLBAR_CELL)*0.92f); width <= S(TOOLBAR_CELL); ++width) {
+            const int size = qRound(S(TOOLBAR_ICON)*(float)width/S(TOOLBAR_CELL));
+            for (int id = BtnDrag; id <= BtnEnd; ++id) {
+                const int states = id == BtnAudio ? 3 : 1;
+                for (int state = 0; state < states; ++state) {
+                    m_audioOnHost = state == 1;
+                    m_audioMutedLocal = state == 2;
+                    const QString key = QStringLiteral("vector:%1:%2:%3").arg(id).arg(size).arg(state);
+                    if (!m_iconCache.contains(key)) m_iconCache.insert(key, drawIcon((ButtonId)id, size));
+                }
+            }
+        }
+        m_audioOnHost = hostAudio;
+        m_audioMutedLocal = muted;
+    };
+    cache.warmIcons();
+
     return true;
 }
 
 void FerryToolbar::destroy()
 {
+    toolbarCaches.erase(this);
 #ifdef Q_OS_WIN32
     if (m_streamHwnd != nullptr) {
         SDL_SetWindowsMessageHook(nullptr, nullptr);
@@ -778,33 +878,12 @@ void FerryToolbar::blitIcon(SDL_Surface* dst, ButtonId id, const SDL_Rect& r)
 {
     int size=qRound(S(TOOLBAR_ICON)*(float)r.w/S(TOOLBAR_CELL));
     if(size<=0)return;
-    QImage icon(size,size,QImage::Format_ARGB32_Premultiplied);icon.fill(Qt::transparent);
-    QPainter p(&icon);p.setRenderHint(QPainter::Antialiasing);p.setWindow(0,0,26,26);
-    QColor color=id==BtnEnd?QColor(229,72,77):(id==BtnAudio&&m_audioOnHost?QColor(149,168,185):QColor(241,246,253));
-    p.setPen(QPen(color,1.75,Qt::SolidLine,Qt::RoundCap,Qt::RoundJoin));p.setBrush(Qt::NoBrush);
-    auto line=[&](double x,double y,double xx,double yy){p.drawLine(QPointF(x,y),QPointF(xx,yy));};
-    switch(id){
-    case BtnDrag:p.setBrush(color);for(int x:{7,13,19})p.drawEllipse(QPointF(x,13),.9,.9);break;
-    case BtnFullscreen:
-        for(int x:{5,21})for(int y:{5,21}){line(x,y,x+(x==5?5:-5),y);line(x,y,x,y+(y==5?5:-5));}break;
-    case BtnPrivacy:{
-        p.drawRoundedRect(QRectF(3,4,17,13),2,2);line(11,17,11,21);line(7,21,14,21);
-        p.setCompositionMode(QPainter::CompositionMode_Clear);p.fillRect(QRectF(15,10,11,15),Qt::transparent);p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        p.drawRoundedRect(QRectF(16,14,8,8),1.5,1.5);p.drawArc(QRectF(18,10,4,7),0,180*16);line(20,17,20,19);break;
+    const int state = id == BtnAudio ? (m_audioOnHost ? 1 : (m_audioMutedLocal ? 2 : 0)) : 0;
+    const QString key = QStringLiteral("vector:%1:%2:%3").arg((int)id).arg(size).arg(state);
+    auto cached = m_iconCache.constFind(key);
+    if (cached != m_iconCache.cend()) {
+        blitImage(dst, cached.value(), r.x+(r.w-size)/2, r.y+(r.h-size)/2);
     }
-    case BtnQuality:
-        for(auto pair:{qMakePair(7,9),qMakePair(13,17),qMakePair(19,11)}){line(4,pair.first,pair.second-2,pair.first);line(pair.second+2,pair.first,22,pair.first);p.drawEllipse(QPointF(pair.second,pair.first),2,2);}break;
-    case BtnAudio:{
-        QPainterPath path;path.moveTo(3,10);path.lineTo(7,10);path.lineTo(12,6);path.lineTo(12,20);path.lineTo(7,16);path.lineTo(3,16);path.closeSubpath();p.drawPath(path);
-        if(m_audioMutedLocal&&!m_audioOnHost)line(4,3,23,23);
-        else {p.drawArc(QRectF(10,8,10,10),-55*16,110*16);p.drawArc(QRectF(10,4,16,18),-55*16,110*16);}break;
-    }
-    case BtnTransfer:{QPainterPath path;path.moveTo(4,17);path.lineTo(4,22);path.lineTo(22,22);path.lineTo(22,17);p.drawPath(path);line(13,17,13,4);line(8,9,13,4);line(13,4,18,9);break;}
-    case BtnEnd:line(6,6,20,20);line(20,6,6,20);break;
-    default:break;
-    }
-    p.end();QImage straight=icon.convertToFormat(QImage::Format_RGBA8888);
-    blitImage(dst,straight,r.x+(r.w-size)/2,r.y+(r.h-size)/2);
 }
 
 void FerryToolbar::blitText(SDL_Surface* dst, const QString& text, SDL_Color color, int x, int y)
@@ -859,6 +938,7 @@ float FerryToolbar::selectionAlpha(int id,bool selected)
 }
 QImage FerryToolbar::debugSnapshot() const
 {
+    const_cast<FerryToolbar*>(this)->present();
     if(!m_surface)return QImage();
     return QImage((uchar*)m_surface->pixels,m_surface->w,m_surface->h,m_surface->pitch,QImage::Format_ARGB32).copy();
 }
@@ -878,21 +958,44 @@ void FerryToolbar::render()
     if (m_window == nullptr) {
         return;
     }
-
-    QHash<int, bool> hoverById;
-    for (const Item& item : m_items) {
-        if (item.hover) {
-            hoverById.insert((int)item.id, true);
-        }
+    auto& cache = toolbarCaches[this];
+    if (!cache.drawing) {
+        cache.dirty = true;
+        return;
     }
 
-    layout();
-    placeLayout();
+    QByteArray layoutKey;
+    QDataStream layoutState(&layoutKey, QIODevice::WriteOnly);
+    layoutState << m_dpr << placementBounds() << screenBounds() << (int)m_dockEdge
+                << m_expanded << m_qualityOpen << m_fullscreen << m_privacy
+                << m_resKey << m_pendingResKey << m_fps << m_pendingFps
+                << m_bitrateMbps << m_pendingBitrateMbps << m_bitrateAuto << m_pendingBitrateAuto
+                << m_codec << m_pendingCodec << m_audioOnHost << m_audioMutedLocal
+                << m_hevcAvailable << m_hevc444Available << m_transferActive;
+    if (layoutKey != cache.layoutKey) {
+        layout();
+        placeLayout();
+        cache.layoutKey = layoutKey;
+        cache.baseSize = QSize(m_surfaceW, m_surfaceH);
+    }
+    m_surfaceW = cache.baseSize.width();
+    m_surfaceH = cache.baseSize.height();
 
-    for (Item& item : m_items) {
-        if (hoverById.value((int)item.id, false)) {
-            item.hover = true;
+    // Hit-test the new geometry; button ids from the previous layout can now
+    // be under a different part of the pointer (collapse, panel, or docking).
+    int mouseX, mouseY, windowX, windowY;
+    SDL_GetGlobalMouseState(&mouseX, &mouseY);
+    SDL_GetWindowPosition(m_window, &windowX, &windowY);
+    if (!m_dragging) {
+        windowX = m_canvasX;
+        windowY = m_canvasY;
+        if (m_expanded && m_revealTick && m_dockEdge == DockTop) {
+            windowY -= qRound(S(10) * (1-FerryToolbarLayout::easeOut((SDL_GetTicks()-m_revealTick)/200.0f)));
         }
+    }
+    Item* hit = m_offscreen ? nullptr : itemAt(mouseX-windowX, mouseY-windowY);
+    for (Item& item : m_items) {
+        item.hover = (&item == hit) && !item.disabled;
     }
 
     // Tooltip for the disabled (on-host) audio button.
@@ -915,7 +1018,11 @@ void FerryToolbar::render()
         }
     }
 
-    SDL_SetWindowSize(m_window, m_surfaceW, m_surfaceH);
+    int windowW, windowH;
+    SDL_GetWindowSize(m_window, &windowW, &windowH);
+    if (windowW != m_surfaceW || windowH != m_surfaceH) {
+        SDL_SetWindowSize(m_window, m_surfaceW, m_surfaceH);
+    }
 
     if (m_surface == nullptr || m_surface->w != m_surfaceW || m_surface->h != m_surfaceH) {
         if (m_surface != nullptr) {
@@ -924,6 +1031,35 @@ void FerryToolbar::render()
         m_surface = SDL_CreateRGBSurfaceWithFormat(0, m_surfaceW, m_surfaceH, 32, SDL_PIXELFORMAT_ARGB8888);
     }
     if (m_surface == nullptr) {
+        return;
+    }
+
+    QByteArray paintKey = layoutKey;
+    QDataStream paintState(&paintKey, QIODevice::Append);
+    const Uint32 now = SDL_GetTicks();
+    const bool done = m_transferDoneTick != 0 && now-m_transferDoneTick < TOOLBAR_DONE_FLASH_MS;
+    paintState << (hit ? (int)hit->id : -1) << m_handleHover << m_transferPercent << done
+               << m_status << m_tooltipVisible << m_tooltipText;
+    // Reveal motion/opacity never invalidate pixels. Press/selection do.
+    paintState << m_pressedId << (m_pressedId >= 0 ? FerryToolbarLayout::pressScale(now-m_pressTick) : 1.0f);
+    for (const Item& item : m_items) {
+        if (m_expanded && item.id <= BtnEnd) paintState << selectionAlpha((int)item.id, item.selected);
+    }
+    for (auto it = m_selectionFades.cbegin(); it != m_selectionFades.cend(); ++it) {
+        if (m_expanded && now-it.value().tick<=150 && it.value().from != it.value().to) {
+            cache.shortWait = true;
+        }
+    }
+    auto& raster = cache.raster[m_expanded ? 1 : 0];
+    if (cache.currentKey == paintKey) return;
+    if (raster.key == paintKey && !raster.image.isNull() &&
+            raster.image.width() == m_surfaceW && raster.image.height() == m_surfaceH) {
+        for (int y = 0; y < m_surfaceH; ++y) {
+            memcpy((Uint8*)m_surface->pixels+y*m_surface->pitch,
+                   raster.image.constScanLine(y), (size_t)m_surfaceW*4);
+        }
+        cache.pixelsDirty = true;
+        cache.currentKey = paintKey;
         return;
     }
 
@@ -1102,85 +1238,104 @@ void FerryToolbar::render()
         m_status.clear();
     }
 
-    present();
-
-    follow();
+    raster.key = paintKey;
+    cache.currentKey = paintKey;
+    raster.image = QImage((uchar*)m_surface->pixels, m_surfaceW, m_surfaceH,
+                          m_surface->pitch, QImage::Format_ARGB32).copy();
+    cache.pixelsDirty = true;
 }
 void FerryToolbar::present()
 {
-    if(m_offscreen)return;
+    if (m_window == nullptr) return;
+    auto& cache = toolbarCaches[this];
+    if (cache.flushing) return;
+    cache.flushing = true;
+    const auto finish = qScopeGuard([&cache]() { cache.flushing = false; });
+    if (cache.dirty) {
+        cache.dirty = false;
+        cache.drawing = true;
+        render();
+        cache.drawing = false;
+    }
+    follow();
+    if (m_offscreen || m_surface == nullptr) return;
 #ifdef Q_OS_WIN32
-    if (m_layered && m_hwnd != nullptr && m_surface != nullptr && m_surfaceW > 0 && m_surfaceH > 0) {
+    if (m_layered && m_hwnd != nullptr) {
         const int w = m_surface->w;
         const int h = m_surface->h;
-        QByteArray bits(w * h * 4, 0);
-        Uint32* src = (Uint32*)m_surface->pixels;
-        const int pitch = m_surface->pitch;
-        uchar* dst = (uchar*)bits.data();
-        for (int y = 0; y < h; y++) {
-            Uint32* row = (Uint32*)((Uint8*)src + y * pitch);
-            uchar* drow = dst + y * w * 4;
-            for (int x = 0; x < w; x++) {
-                Uint32 px = row[x];
-                Uint8 a = (px >> 24) & 0xFF;
-                Uint8 r = (px >> 16) & 0xFF;
-                Uint8 g = (px >> 8) & 0xFF;
-                Uint8 b = px & 0xFF;
-                drow[x * 4 + 0] = (b * a) / 255;
-                drow[x * 4 + 1] = (g * a) / 255;
-                drow[x * 4 + 2] = (r * a) / 255;
-                drow[x * 4 + 3] = a;
+        int wx, wy;
+        SDL_GetWindowPosition(m_window, &wx, &wy);
+        const BYTE alpha = (BYTE)(255*(m_expanded&&m_revealTick?FerryToolbarLayout::easeOut((SDL_GetTicks()-m_revealTick)/200.0f):1.0f));
+        if (!cache.pixelsDirty && wx == cache.x && wy == cache.y && alpha == cache.alpha) return;
+
+        if (cache.dc == nullptr || cache.width != w || cache.height != h) {
+            cache.release();
+            BITMAPINFO bi = {};
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = -h;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            HDC dc = CreateCompatibleDC(nullptr);
+            void* bits = nullptr;
+            HBITMAP bitmap = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+            if (bitmap == nullptr || bits == nullptr) {
+                if (bitmap != nullptr) DeleteObject(bitmap);
+                if (dc != nullptr) DeleteDC(dc);
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Ferry toolbar: DIB allocation failed: %lu", GetLastError());
+                return;
+            }
+            HGDIOBJ old = SelectObject(dc, bitmap);
+            if (old == nullptr || old == HGDI_ERROR) {
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                return;
+            }
+            cache.dc = dc;
+            cache.bitmap = bitmap;
+            cache.oldBitmap = old;
+            cache.bits = bits;
+            cache.width = w;
+            cache.height = h;
+        }
+        if (cache.pixelsDirty) {
+            // Convert straight ARGB to premultiplied BGRA directly in the
+            // persistent top-down DIB. Moving/fading reuses these pixels.
+            for (int y = 0; y < h; ++y) {
+                const Uint32* row = (const Uint32*)((const Uint8*)m_surface->pixels + y*m_surface->pitch);
+                uchar* dst = (uchar*)cache.bits + y*w*4;
+                for (int x = 0; x < w; ++x) {
+                    const Uint32 px = row[x];
+                    const Uint8 a = (px >> 24) & 0xFF;
+                    dst[x*4] = ((px & 0xFF)*a)/255;
+                    dst[x*4+1] = (((px >> 8) & 0xFF)*a)/255;
+                    dst[x*4+2] = (((px >> 16) & 0xFF)*a)/255;
+                    dst[x*4+3] = a;
+                }
             }
         }
-
-        BITMAPINFO bi;
-        ZeroMemory(&bi, sizeof(bi));
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h; // top-down DIB
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-
-        HDC screenDC = GetDC(nullptr);
-        HDC memDC = CreateCompatibleDC(screenDC);
-        void* pvBits = nullptr;
-        HBITMAP hbm = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
-        if (hbm != nullptr && pvBits != nullptr) {
-            memcpy(pvBits, bits.constData(), (size_t)w * h * 4);
-            HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, hbm);
-
-            int wx, wy;
-            SDL_GetWindowPosition(m_window, &wx, &wy);
-            POINT ptDst = { wx, wy };
-            SIZE size = { w, h };
-            POINT ptSrc = { 0, 0 };
-            BLENDFUNCTION blend;
-            blend.BlendOp = AC_SRC_OVER;
-            blend.BlendFlags = 0;
-            blend.SourceConstantAlpha = (BYTE)(255*(m_expanded&&m_revealTick?FerryToolbarLayout::easeOut((SDL_GetTicks()-m_revealTick)/200.0f):1.0f));
-            blend.AlphaFormat = AC_SRC_ALPHA;
-
-            UpdateLayeredWindow((HWND)m_hwnd, screenDC, &ptDst, &size, memDC, &ptSrc, 0, &blend, ULW_ALPHA);
-
-            SelectObject(memDC, oldBmp);
-            DeleteObject(hbm);
+        POINT ptDst = {wx, wy}, ptSrc = {0, 0};
+        SIZE size = {w, h};
+        BLENDFUNCTION blend = {};
+        blend.BlendOp = AC_SRC_OVER;
+        blend.SourceConstantAlpha = alpha;
+        blend.AlphaFormat = AC_SRC_ALPHA;
+        if (UpdateLayeredWindow((HWND)m_hwnd, nullptr, &ptDst, &size, (HDC)cache.dc, &ptSrc, 0, &blend, ULW_ALPHA)) {
+            cache.pixelsDirty = false;
+            cache.x = wx;
+            cache.y = wy;
+            cache.alpha = alpha;
         }
-        DeleteDC(memDC);
-        ReleaseDC(nullptr, screenDC);
         return;
     }
 #endif
-    // Fallback (non-Windows): copy the offscreen surface to the window surface.
-    if (m_window != nullptr && m_surface != nullptr) {
-        SDL_Surface* ws = SDL_GetWindowSurface(m_window);
-        if (ws != nullptr) {
-            SDL_BlitSurface(m_surface, nullptr, ws, nullptr);
-            SDL_UpdateWindowSurface(m_window);
-        }
+    if (!cache.pixelsDirty) return;
+    SDL_Surface* ws = SDL_GetWindowSurface(m_window);
+    if (ws != nullptr && SDL_BlitSurface(m_surface, nullptr, ws, nullptr) == 0 && SDL_UpdateWindowSurface(m_window) == 0) {
+        cache.pixelsDirty = false;
     }
 }
-
 void FerryToolbar::computeClientRect(int& cx, int& cy, int& cw, int& ch)
 {
     cx = 0;
@@ -1228,9 +1383,7 @@ void FerryToolbar::reposition(int cx, int cy, int cw, int ch)
         SDL_SetWindowPosition(m_window, tx, ty);
         m_lastTx = tx;
         m_lastTy = ty;
-        // The layered snapshot is positioned independently of the HWND, so
-        // re-present it at the new position whenever the window moves.
-        present();
+        // Position changes are presented once at the end of tick().
     }
 }
 
@@ -1323,6 +1476,29 @@ void FerryToolbar::tick()
         return;
     }
 
+    // Every early return (including dragging) shares one final presentation.
+    const auto flush = qScopeGuard([this]() { present(); });
+    auto& cache = toolbarCaches[this];
+#ifdef Q_OS_WIN32
+    if (m_streamHwnd != nullptr) {
+        typedef UINT (WINAPI* GetDpiForWindowFn)(HWND);
+        const auto getDpi = (GetDpiForWindowFn)(void*)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+        const UINT dpi = getDpi ? getDpi((HWND)m_streamHwnd) : 0;
+        const float dpr = dpi ? dpi/96.0f : m_dpr;
+        if (!qFuzzyCompare(m_dpr, dpr)) {
+            m_dpr = dpr;
+            if (m_font != nullptr) TTF_CloseFont((TTF_Font*)m_font);
+            m_fontSize = S(TOOLBAR_FONT_SIZE);
+            m_font = loadToolbarFont(m_fontSize);
+            m_iconCache.clear();
+            cache.warmIcons();
+            for (auto& raster : cache.raster) raster = {};
+            cache.layoutKey.clear();
+            render();
+        }
+    }
+#endif
+
     FerryBridge::readMessages();
 
     if (m_transferActive && (SDL_GetTicks() - m_lastTransferTick) > TOOLBAR_TRANSFER_TIMEOUT) {
@@ -1342,8 +1518,17 @@ void FerryToolbar::tick()
     computeClientRect(cx, cy, cw, ch);
 
     Uint32 now = SDL_GetTicks();
+    if (m_transferDoneTick && now-m_transferDoneTick >= TOOLBAR_DONE_FLASH_MS) {
+        m_transferDoneTick = 0;
+        render();
+    }
+    if (!m_status.isEmpty() && now-m_statusTick >= TOOLBAR_STATUS_MS) {
+        m_status.clear();
+        render();
+    }
 
     if (m_dragging) {
+        cache.shortWait = true;
         if (!(buttons & SDL_BUTTON(SDL_BUTTON_LEFT))) {
             m_dragging = false;
             SDL_CaptureMouse(SDL_FALSE);
@@ -1356,7 +1541,7 @@ void FerryToolbar::tick()
             SDL_SetWindowPosition(m_window, nx, ny);
             m_lastTx = nx;
             m_lastTy = ny;
-            present(); // keep the layered snapshot following the pointer
+            // Presentation is coalesced at the end of tick(). // keep the layered snapshot following the pointer
         }
         return;
     }
@@ -1396,9 +1581,18 @@ void FerryToolbar::tick()
         }
     }
 
-    bool animating=(m_pressTick && now-m_pressTick<120)||(m_revealTick&&now-m_revealTick<200);
-    for(auto it=m_selectionFades.cbegin();it!=m_selectionFades.cend();++it)animating|=(now-it.value().tick<150);
-    if(animating)render();
+    bool pixelsAnimating = m_pressTick && now-m_pressTick<=120;
+    for(auto it=m_selectionFades.cbegin();it!=m_selectionFades.cend();++it)
+        pixelsAnimating |= now-it.value().tick<=150 && it.value().from != it.value().to;
+    // Include the final stable frame, then return to the session's long wait.
+    if (pixelsAnimating || cache.pixelsAnimating) render();
+    cache.pixelsAnimating = pixelsAnimating;
+    cache.shortWait = pixelsAnimating || (m_expanded && m_revealTick && now-m_revealTick<=200);
+    Item* hit = itemAt(mouseX-wx, mouseY-wy);
+    for (Item& item : m_items) {
+        const bool hovered = &item == hit && !item.disabled;
+        if (item.hover != hovered) render();
+    }
     follow();
 }
 
