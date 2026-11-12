@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import QtQuick.Controls 2.2
+import QtQuick.Controls.Material 2.2
 import QtQuick.Window 2.2
 
 import SdlGamepadKeyNavigation 1.0
@@ -200,24 +201,47 @@ Item {
         sourceComponent: Item {}
     }
 
-    Row {
+    Rectangle {
+        anchors.fill: parent
+        color: "#1E1E1E"
+    }
+
+    Item {
+        id: stageBlock
         anchors.centerIn: parent
-        spacing: 5
+        width: Math.max(stageSpinner.implicitWidth, stageLabel.implicitWidth, loadingHint.implicitWidth)
+        height: stageSpinner.implicitHeight + 18 + stageLabel.implicitHeight + 8 + loadingHint.implicitHeight
 
         BusyIndicator {
             id: stageSpinner
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
             running: visible
             visible: false
+            Material.accent: "#6CB6FF"
         }
 
         Label {
             id: stageLabel
-            height: stageSpinner.height
-            text: stageText
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: stageSpinner.bottom
+            anchors.topMargin: 18
+            text: "正在启动 Desktop…"
+            color: "#E6E6E6"
             font.pointSize: 20
-            verticalAlignment: Text.AlignVCenter
+            horizontalAlignment: Text.AlignHCenter
+        }
 
-            wrapMode: Text.Wrap
+        Label {
+            id: loadingHint
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: stageLabel.bottom
+            anchors.topMargin: 8
+            visible: stageLabel.visible
+            text: "应用程序列表加载中"
+            color: "#8C8C8C"
+            font.pointSize: 14
+            horizontalAlignment: Text.AlignHCenter
         }
     }
 

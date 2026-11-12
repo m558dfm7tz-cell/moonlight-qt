@@ -1,6 +1,7 @@
 #include "session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
+#include "gui/wintitlebar.h"
 #include "streaming/ferry.h"
 #include "streaming/ferrytoolbar.h"
 #include "backend/richpresencemanager.h"
@@ -1592,6 +1593,7 @@ void Session::toggleFullscreen()
 
     // Actually enter/leave fullscreen
     SDL_SetWindowFullscreen(m_Window, fullScreen ? m_FullScreenFlag : 0);
+    applySdlWindowTitleBar(m_Window);
 
     // Ferry toolbar: reflect the new fullscreen state.
     if (m_Toolbar != nullptr) {
@@ -1922,13 +1924,8 @@ void Session::exec()
 #endif
     }
 
-    // We use only the computer name on macOS to match Apple conventions where the
-    // app name is featured in the menu bar and the document name is in the title bar.
-#ifdef Q_OS_DARWIN
+    // Title bar shows only the remote computer name.
     std::string windowName = QString(m_Computer->name).toStdString();
-#else
-    std::string windowName = QString(m_Computer->name + " - Moonlight").toStdString();
-#endif
 
     m_Window = SDL_CreateWindow(windowName.c_str(),
                                 x,
@@ -2032,6 +2029,7 @@ void Session::exec()
     if (m_IsFullScreen) {
         SDL_SetWindowFullscreen(m_Window, m_FullScreenFlag);
     }
+    applySdlWindowTitleBar(m_Window);
 
     bool needsFirstEnterCapture = false;
     bool needsPostDecoderCreationCapture = false;
@@ -2241,6 +2239,15 @@ void Session::exec()
             case SDL_WINDOWEVENT_ENTER:
                 if (fromStreamWindow) {
                     m_InputHandler->notifyMouseEnter();
+                }
+                break;
+            case SDL_WINDOWEVENT_SHOWN:
+            case SDL_WINDOWEVENT_MAXIMIZED:
+            case SDL_WINDOWEVENT_RESTORED:
+            case SDL_WINDOWEVENT_SIZE_CHANGED:
+            case SDL_WINDOWEVENT_RESIZED:
+                if (fromStreamWindow) {
+                    applySdlWindowTitleBar(m_Window);
                 }
                 break;
             }

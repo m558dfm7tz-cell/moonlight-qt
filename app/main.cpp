@@ -64,6 +64,7 @@
 #include "streaming/ferrytoolbar_preview.h"
 #include "settings/streamingpreferences.h"
 #include "gui/sdlgamepadkeynavigation.h"
+#include "gui/wintitlebar.h"
 
 #if defined(Q_OS_WIN32)
 #define IS_UNSPECIFIED_HANDLE(x) ((x) == INVALID_HANDLE_VALUE || (x) == NULL)
@@ -1139,6 +1140,7 @@ int main(int argc, char *argv[])
                                     : QStringLiteral("qrc:/gui/main.qml")));
         if (engine.rootObjects().isEmpty())
             return -1;
+        installQtWindowTitleBarStyle();
     }
 
     int err = app.exec();

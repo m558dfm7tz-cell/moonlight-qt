@@ -1,15 +1,15 @@
 import QtQuick 2.0
 import QtQuick.Controls 2.2
+import QtQuick.Controls.Material 2.2
 
 import ComputerManager 1.0
 
 Item {
     function onSearchingComputer() {
-        stageLabel.text = qsTr("Establishing connection to PC...")
+        // Copy stays fixed: primary "正在启动 Desktop…", secondary below.
     }
 
     function onSearchingApp() {
-        stageLabel.text = qsTr("Loading app list...")
     }
 
     function onSessionCreated(appName, session) {
@@ -19,7 +19,7 @@ Item {
             "session": session,
             "quitAfter": true
         })
-        stackView.push(segue)
+        stackView.push(segue, {}, StackView.Immediate)
     }
 
     function onLaunchFailed(message) {
@@ -53,22 +53,44 @@ Item {
         }
     }
 
-    Row {
+    Rectangle {
+        anchors.fill: parent
+        color: "#1E1E1E"
+    }
+
+    Item {
         anchors.centerIn: parent
-        spacing: 5
+        width: Math.max(stageSpinner.implicitWidth, stageLabel.implicitWidth, loadingHint.implicitWidth)
+        height: stageSpinner.implicitHeight + 18 + stageLabel.implicitHeight + 8 + loadingHint.implicitHeight
 
         BusyIndicator {
             id: stageSpinner
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
             running: visible
+            Material.accent: "#6CB6FF"
         }
 
         Label {
             id: stageLabel
-            height: stageSpinner.height
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: stageSpinner.bottom
+            anchors.topMargin: 18
+            text: "正在启动 Desktop…"
+            color: "#E6E6E6"
             font.pointSize: 20
-            verticalAlignment: Text.AlignVCenter
+            horizontalAlignment: Text.AlignHCenter
+        }
 
-            wrapMode: Text.Wrap
+        Label {
+            id: loadingHint
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: stageLabel.bottom
+            anchors.topMargin: 8
+            text: "应用程序列表加载中"
+            color: "#8C8C8C"
+            font.pointSize: 14
+            horizontalAlignment: Text.AlignHCenter
         }
     }
 

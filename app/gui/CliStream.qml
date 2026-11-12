@@ -6,7 +6,6 @@ import QtQuick.Controls.Material 2.2
 
 import ComputerManager 1.0
 import StreamingPreferences 1.0
-import SystemProperties 1.0
 import SdlGamepadKeyNavigation 1.0
 
 // Minimal QML host used for CLI / Ferry stream launches. Unlike main.qml, this
@@ -16,13 +15,14 @@ import SdlGamepadKeyNavigation 1.0
 
 ApplicationWindow {
     id: window
+    title: "远程桌面"
     width: 640
     height: 480
+    Material.theme: Material.Dark
+    Material.background: "#1E1E1E"
 
     function doEarlyInit() {
-        if (SystemProperties.usesMaterial3Theme) {
-            Material.background = "#303030"
-        }
+        Material.background = "#1E1E1E"
         SdlGamepadKeyNavigation.enable()
     }
 

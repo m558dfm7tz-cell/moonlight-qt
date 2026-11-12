@@ -192,7 +192,7 @@ bool FerryToolbar::init(SDL_Window* streamWindow, bool offscreen)
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Ferry toolbar: no font available");
     }
 
-    m_window = SDL_CreateWindow("FerryRemoteToolbar",
+    m_window = SDL_CreateWindow("",
                                 0, 0,
                                 S(TOOLBAR_CELL) + S(TOOLBAR_MARGIN) * 2,
                                 S(TOOLBAR_CELL) + S(TOOLBAR_MARGIN) * 2,

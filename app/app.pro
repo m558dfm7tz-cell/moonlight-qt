@@ -199,6 +199,7 @@ SOURCES += \
     streaming/ferrytoolbar_preview.cpp \
     gui/computermodel.cpp \
     gui/appmodel.cpp \
+    gui/wintitlebar.cpp \
     streaming/bandwidth.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
@@ -236,6 +237,7 @@ HEADERS += \
     streaming/audio/renderers/sdl.h \
     gui/computermodel.h \
     gui/appmodel.h \
+    gui/wintitlebar.h \
     streaming/video/decoder.h \
     streaming/bandwidth.h \
     streaming/streamutils.h \
